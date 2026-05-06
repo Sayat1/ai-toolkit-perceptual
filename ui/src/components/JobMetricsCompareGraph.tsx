@@ -428,37 +428,41 @@ export default function JobMetricsCompareGraph({ job }: Props) {
                 <Tooltip content={renderTooltip} cursor={{ stroke: 'rgba(59,130,246,0.25)', strokeWidth: 1 }} />
                 <Legend wrapperStyle={{ paddingTop: 8, color: 'rgba(255,255,255,0.7)', fontSize: 12 }} />
 
-                {selectedJobIDs.map((jid, idx) => {
+                {selectedJobIDs.flatMap((jid, idx) => {
                   const color = colorForJob(jid, idx);
                   const name = jobsById.get(jid)?.name ?? jid;
-                  return (
-                    <g key={jid}>
-                      {showRaw && (
-                        <Line
-                          type="monotone"
-                          dataKey={`${jid}__raw`}
-                          name={`${name} (raw)`}
-                          stroke={color.replace('1)', '0.40)')}
-                          strokeWidth={1.25}
-                          dot={false}
-                          isAnimationActive={false}
-                          connectNulls
-                        />
-                      )}
-                      {showSmoothed && (
-                        <Line
-                          type="monotone"
-                          dataKey={`${jid}__smooth`}
-                          name={name}
-                          stroke={color}
-                          strokeWidth={2}
-                          dot={false}
-                          isAnimationActive={false}
-                          connectNulls
-                        />
-                      )}
-                    </g>
-                  );
+                  const lines: any[] = [];
+                  if (showRaw) {
+                    lines.push(
+                      <Line
+                        key={`${jid}__raw`}
+                        type="monotone"
+                        dataKey={`${jid}__raw`}
+                        name={`${name} (raw)`}
+                        stroke={color.replace('1)', '0.40)')}
+                        strokeWidth={1.25}
+                        dot={false}
+                        isAnimationActive={false}
+                        connectNulls
+                      />
+                    );
+                  }
+                  if (showSmoothed) {
+                    lines.push(
+                      <Line
+                        key={`${jid}__smooth`}
+                        type="monotone"
+                        dataKey={`${jid}__smooth`}
+                        name={name}
+                        stroke={color}
+                        strokeWidth={2}
+                        dot={false}
+                        isAnimationActive={false}
+                        connectNulls
+                      />
+                    );
+                  }
+                  return lines;
                 })}
               </LineChart>
             </ResponsiveContainer>
