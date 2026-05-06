@@ -196,7 +196,7 @@ export default function JobMetricsGraph({ job }: Props) {
   const [showRaw, setShowRaw] = useState(false);
   const [showSmoothed, setShowSmoothed] = useState(true);
   const [showTrend, setShowTrend] = useState(true);
-  const [smoothing, setSmoothing] = useState(90);
+  const [smoothing, setSmoothing] = useState(0);
   const [plotStride, setPlotStride] = useState(1);
   const [windowSize, setWindowSize] = useState<number>(0);
   const [enabled, setEnabled] = useState<Record<string, boolean>>({});

@@ -72,8 +72,8 @@ export default function JobLossGraph({ job }: Props) {
   const [showRaw, setShowRaw] = useState(false);
   const [showSmoothed, setShowSmoothed] = useState(true);
 
-  // 0..100 slider. 100 = no smoothing, 0 = heavy smoothing.
-  const [smoothing, setSmoothing] = useState(90);
+  // 0..100 slider. 0 = no smoothing, 100 = heavy smoothing.
+  const [smoothing, setSmoothing] = useState(0);
 
   // UI-only downsample for rendering speed
   const [plotStride, setPlotStride] = useState(1);
