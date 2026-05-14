@@ -10,15 +10,14 @@ import JobOverview from '@/components/JobOverview';
 import { redirect, useRouter, useSearchParams } from 'next/navigation';
 import JobActionBar from '@/components/JobActionBar';
 import JobConfigViewer from '@/components/JobConfigViewer';
-import JobLossGraph from '@/components/JobLossGraph';
 import JobMetricsGraph from '@/components/JobMetricsGraph';
 import JobMetricsCompareGraph from '@/components/JobMetricsCompareGraph';
 import DepthPreviews from '@/components/DepthPreviews';
 import { Job } from '@prisma/client';
 import { JobConfig } from '@/types';
 
-type PageKey = 'overview' | 'samples' | 'depth_previews' | 'config' | 'loss_log' | 'metrics_new' | 'metrics_compare';
-const PAGE_KEYS = new Set<PageKey>(['overview', 'samples', 'depth_previews', 'config', 'loss_log', 'metrics_new', 'metrics_compare']);
+type PageKey = 'overview' | 'samples' | 'depth_previews' | 'config' | 'metrics' | 'metrics_compare';
+const PAGE_KEYS = new Set<PageKey>(['overview', 'samples', 'depth_previews', 'config', 'metrics', 'metrics_compare']);
 
 interface Page {
   name: string;
@@ -62,17 +61,8 @@ const pages: Page[] = [
     condition: hasDepthPreviews,
   },
   {
-    name: 'Loss Graph',
-    value: 'loss_log',
-    component: JobLossGraph,
-    mainCss: 'pt-24',
-  },
-  {
-    // Step 5: parallel-installed alongside the legacy "Loss Graph". Reads
-    // the canonical `subsystem/kind/variant` namespace + per-sample
-    // breakdown payloads added in steps 3-4.
-    name: 'Metrics (new)',
-    value: 'metrics_new',
+    name: 'Metrics',
+    value: 'metrics',
     component: JobMetricsGraph,
     mainCss: 'pt-24',
   },
