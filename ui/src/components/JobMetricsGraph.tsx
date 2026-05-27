@@ -95,6 +95,28 @@ function emaSmoothPoints(points: { step: number; value: number }[], alpha: numbe
   return out;
 }
 
+// Boxcar (rolling) mean over a fixed window. Each output point i is the mean
+// of points (i - window + 1 .. i), preserving the original `step` and any
+// extra per-point fields. For i < window-1 the window is truncated to the
+// available history — this matches how most plotting tools render a moving
+// average and avoids dropping leading points.
+function rollingMeanPoints<P extends { step: number; value: number }>(
+  points: P[],
+  window: number,
+): P[] {
+  const w = Math.max(1, Math.floor(window));
+  if (w <= 1 || points.length === 0) return points;
+  const out: P[] = new Array(points.length);
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    sum += points[i].value;
+    if (i >= w) sum -= points[i - w].value;
+    const denom = Math.min(i + 1, w);
+    out[i] = { ...points[i], value: sum / denom };
+  }
+  return out;
+}
+
 function formatNum(v: number) {
   if (!Number.isFinite(v)) return '';
   if (Math.abs(v) >= 1000) return v.toFixed(0);
@@ -201,6 +223,10 @@ export default function JobMetricsGraph({ job }: Props) {
   const [smoothing, setSmoothing] = useLocalStorageState(lsKey('smoothing'), 0);
   const [plotStride, setPlotStride] = useLocalStorageState(lsKey('plotStride'), 1);
   const [windowSize, setWindowSize] = useLocalStorageState<number>(lsKey('windowSize'), 0);
+  // Rolling-mean window — replaces raw point values with the mean of the
+  // last N points before EMA / windowSize trim. N=1 = identity (off).
+  // Useful as a stable "epoch-like" average decoupled from epoch boundaries.
+  const [rollingMean, setRollingMean] = useLocalStorageState<number>(lsKey('rollingMean'), 1);
   const [enabled, setEnabled] = useLocalStorageState<Record<string, boolean>>(lsKey('enabled'), {});
 
   // by_sample-facet-only state: which metric to fan into per-sample series,
@@ -362,6 +388,14 @@ export default function JobMetricsGraph({ job }: Props) {
           .filter((_, idx) => idx % stride === 0);
       }
 
+      // Rolling-mean transform runs over the FULL strided history (before
+      // the trailing-window trim) so the leftmost visible point still has a
+      // full N points of history behind it. Skipped in by_sample mode —
+      // per-sample series are sparse / non-contiguous and a rolling mean
+      // across the gaps would be misleading (same reason EMA is skipped).
+      if (rollingMean > 1 && facet !== 'by_sample') {
+        raw = rollingMeanPoints(raw, rollingMean);
+      }
       if (windowSize > 0 && raw.length > windowSize) {
         raw = raw.slice(raw.length - windowSize);
       }
@@ -383,6 +417,7 @@ export default function JobMetricsGraph({ job }: Props) {
     smoothing,
     plotStride,
     windowSize,
+    rollingMean,
     useLogScale,
     facet,
     pivotedSamples,
@@ -907,6 +942,34 @@ export default function JobMetricsGraph({ job }: Props) {
               onChange={e => setPlotStride(Number(e.target.value))}
               className="w-full accent-emerald-500"
             />
+          </div>
+
+          <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 md:col-span-2">
+            <div className="flex items-center justify-between mb-1">
+              <label className="block text-xs text-gray-400">
+                Rolling mean window
+                {facet === 'by_sample' && (
+                  <span className="ml-2 text-[10px] text-gray-500">(disabled in by-sample mode)</span>
+                )}
+              </label>
+              <span className="text-xs text-gray-300">
+                {rollingMean === 1 ? 'off' : `avg of last ${rollingMean.toLocaleString()} pts`}
+              </span>
+            </div>
+            <input
+              type="range"
+              min={1}
+              max={1000}
+              step={1}
+              value={rollingMean}
+              onChange={e => setRollingMean(Number(e.target.value))}
+              className="w-full accent-emerald-500"
+              disabled={facet === 'by_sample'}
+            />
+            <div className="mt-2 text-[11px] text-gray-500">
+              Each point becomes the mean of the last N raw points — a stable
+              alternative to epoch averages when epoch size varies.
+            </div>
           </div>
 
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 md:col-span-2">

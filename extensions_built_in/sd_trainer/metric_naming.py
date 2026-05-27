@@ -53,6 +53,7 @@ CANONICAL_RENAMES: Dict[str, str] = {
 
     # diffusion / training
     "diffusion_loss": "diffusion/loss_raw",
+    "diffusion_loss_weighted": "diffusion/loss_weighted",
     "diffusion_loss_applied": "diffusion/loss_applied",
 
     # identity
@@ -101,6 +102,9 @@ CANONICAL_RENAMES: Dict[str, str] = {
     "grad_norm_diffusion": "grad/norm/diffusion",
     "grad_norm_depth": "grad/norm/depth",
     "grad_cos_diff_depth": "grad/cos/diff_depth",
+
+    # sharpness / curvature diagnostic
+    "fisher_trace": "grad/fisher",
 
     # tokens
     "face_token_norm": "tokens/face/norm",

@@ -48,12 +48,25 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             hbsmntw_weighing[num_timesteps //
                              2:] = hbsmntw_weighing[num_timesteps // 2:].max()
 
+            # Low-t-emphasizing variant: same Gaussian width as bsmntw but
+            # centered at the low-t end of the schedule (high step index =
+            # clean side). The trainer schedules step index 0 at t=1000 and
+            # step index N-1 at t=1, so a Gaussian centered at x=N peaks at
+            # low t. Mean-normalized like bsmntw so it composes cleanly with
+            # the rest of the loss; the diffusion loss on low-t (clean)
+            # samples is boosted while still being a smooth curve rather than
+            # a hard window.
+            y_low = torch.exp(-2 * ((x - num_timesteps) / num_timesteps) ** 2)
+            y_low_shifted = y_low - y_low.min()
+            low_t_weighing = y_low_shifted * (num_timesteps / y_low_shifted.sum())
+
             # Create linear timesteps from 1000 to 1
             timesteps = torch.linspace(1000, 1, num_timesteps, device='cpu')
 
             self.linear_timesteps = timesteps
             self.linear_timesteps_weights = bsmntw_weighing
             self.linear_timesteps_weights2 = hbsmntw_weighing
+            self.low_t_weighing = low_t_weighing
             pass
 
     def get_weights_for_timesteps(self, timesteps: torch.Tensor, v2=False, timestep_type="linear") -> torch.Tensor:
@@ -70,6 +83,14 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             )
         if v2:
             weights = self.linear_timesteps_weights2[step_indices].flatten()
+        elif timestep_type == "weighted_low":
+            # Half-bell peaked at the low-t end of the schedule.
+            weights = self.low_t_weighing[step_indices].flatten()
+        elif timestep_type == "custom" and getattr(self, "custom_curve_weights", None) is not None:
+            # Custom-curve weights are pre-resolved on `set_train_timesteps`
+            # (PCHIP-evaluated into a 1000-step tensor). Indexing is the same
+            # as the built-in `weighted` path.
+            weights = self.custom_curve_weights[step_indices].flatten()
         else:
             weights = self.linear_timesteps_weights[step_indices].flatten()
 
@@ -110,10 +131,21 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         device,
         timestep_type='linear',
         latents=None,
-        patch_size=1
+        patch_size=1,
+        custom_curve=None,
     ):
         self.timestep_type = timestep_type
-        if timestep_type == 'linear' or timestep_type == 'weighted':
+        if timestep_type == 'custom':
+            # Re-resolve the curve from disk if the inlined snapshot carries
+            # a sourceName — otherwise an edit-and-rerun loop silently uses
+            # the stale snapshot. Cache by the resolved dict's identity.
+            from toolkit.timestep_weighing.custom_curve import resolve_curve_weights, resolve_live_curve
+            live_curve = resolve_live_curve(custom_curve, 'weighting')
+            cached_for = getattr(self, "_custom_curve_resolved_for", None)
+            if cached_for is not live_curve or getattr(self, "custom_curve_weights", None) is None:
+                self.custom_curve_weights = resolve_curve_weights(live_curve, num_timesteps).to(device)
+                self._custom_curve_resolved_for = live_curve
+        if timestep_type in ('linear', 'weighted', 'weighted_low', 'custom'):
             timesteps = torch.linspace(1000, 1, num_timesteps, device=device)
             self.timesteps = timesteps
             return timesteps

@@ -129,6 +129,16 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         self.module_dropout = module_dropout
         self.is_checkpointing = False
 
+        # Tag every LoRA-owned parameter so SDTrainer's gradient-noise
+        # injector can filter to LoRA-only without re-walking the module
+        # tree. nn.Parameter is a Tensor subclass and allows attribute
+        # set, so this is just a marker — no Parameter wrapping cost.
+        self.lora_down.weight._is_lora = True
+        if hasattr(self.lora_up, 'weight'):
+            self.lora_up.weight._is_lora = True
+        if use_bias and getattr(self.lora_up, 'bias', None) is not None:
+            self.lora_up.bias._is_lora = True
+
     def apply_to(self):
         self.org_forward = self.org_module[0].forward
         self.org_module[0].forward = self.forward
@@ -538,6 +548,17 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         for lora in self.text_encoder_loras + self.unet_loras:
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
+
+        # Tag every parameter on every registered adapter module with
+        # `_is_lora=True` so SDTrainer's gradient-noise injector can
+        # filter to adapter-only params regardless of network_type
+        # (lora / lokr / loha / fullrank etc.) without having to know
+        # the module class. Per-module-class tagging missed LokrModule
+        # (and any future adapter type); walking the network-level
+        # list is the single source of truth.
+        for adapter in self.text_encoder_loras + self.unet_loras:
+            for p in adapter.parameters():
+                p._is_lora = True
 
         if self.full_train_in_out:
             print("full train in out")

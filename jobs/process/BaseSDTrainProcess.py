@@ -1288,6 +1288,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         timestep_type=timestep_type,
                         latents=latents,
                         patch_size=patch_size,
+                        custom_curve=getattr(self.train_config, 'custom_timestep_curve', None),
                     )
                 else:
                     self.sd.noise_scheduler.set_timesteps(
@@ -1373,6 +1374,55 @@ class BaseSDTrainProcess(BaseTrainProcess):
                             (batch_size,),
                             device=self.device_torch
                         )
+                    timestep_indices = timestep_indices.long()
+                elif content_or_style == 'custom':
+                    # Custom-distribution sampling: evaluate the user's curve
+                    # at each scheduled timestep's actual t-position, then
+                    # draw `batch_size` schedule indices via multinomial. We
+                    # have to evaluate against the schedule's actual
+                    # timesteps rather than uniformly-spaced x — otherwise
+                    # for non-uniform schedules (e.g. sigmoid) a peak the
+                    # user drew at "noisy" would land somewhere else in the
+                    # schedule. The editor labels x=0 as "noisy (t=1)" and
+                    # x=1 as "clean (t=0)", so curve x = 1 - t_normalized.
+                    #
+                    # We subtract the curve's minimum before normalizing to
+                    # a PMF so the *peak/trough ratio* the user drew (rather
+                    # than the integrated baseline area) controls
+                    # concentration. The UI's BandPreview applies the same
+                    # transform so the predicted vs. actual histograms line
+                    # up. Flat curves collapse to all-zero and fall back to
+                    # uniform via the existing degeneracy guard below.
+                    from toolkit.timestep_weighing.custom_curve import evaluate_curve_at_xs, resolve_live_curve
+                    # Re-resolve the curve from disk if the inlined snapshot
+                    # carries a sourceName — otherwise an edit-and-rerun
+                    # loop silently uses the snapshot's old shape.
+                    live_curve = resolve_live_curve(
+                        self.train_config.custom_timestep_distribution, 'distribution',
+                    )
+                    schedule_t = self.sd.noise_scheduler.timesteps.float().to(self.device_torch)
+                    num_ts = float(self.train_config.num_train_timesteps)
+                    xs_norm = (1.0 - schedule_t / num_ts).clamp(0.0, 1.0)
+                    weights = evaluate_curve_at_xs(
+                        live_curve,
+                        xs_norm,
+                    ).to(self.device_torch)
+                    weights = torch.clamp(weights - weights.min(), min=0.0)
+                    if min_noise_steps > 0 or max_noise_steps < weights.shape[0] - 1:
+                        mask = torch.zeros_like(weights)
+                        mask[min_noise_steps:max_noise_steps + 1] = 1.0
+                        weights = weights * mask
+                    total = weights.sum()
+                    if not torch.isfinite(total) or total <= 0:
+                        # Degenerate curve (or no overlap with the noise range):
+                        # fall back to uniform over the allowed range.
+                        timestep_indices = torch.randint(
+                            min_noise_steps, max(min_noise_steps + 1, max_noise_steps),
+                            (batch_size,), device=self.device_torch,
+                        )
+                    else:
+                        pmf = weights / total
+                        timestep_indices = torch.multinomial(pmf, batch_size, replacement=True)
                     timestep_indices = timestep_indices.long()
                 else:
                     raise ValueError(f"Unknown content_or_style {content_or_style}")

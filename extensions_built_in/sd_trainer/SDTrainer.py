@@ -178,7 +178,17 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_vae_anchor_loss: Optional[float] = None
         self._last_vae_anchor_loss_applied: Optional[float] = None
         self._last_vae_anchor_per_level: Optional[dict] = None
+        # _last_diffusion_loss is the TRUE raw MSE mean (pre-weight, pre-gate)
+        # — captured immediately after the loss is computed, before any
+        # timestep-weight multiply. _last_diffusion_loss_weighted is the same
+        # mean AFTER the timestep-weight multiply but BEFORE gating /
+        # diffusion_loss_weight scaling. _last_diffusion_loss_applied is the
+        # post-everything scalar that actually feeds the optimizer. Plot
+        # `diffusion/loss_raw` against `diffusion/loss_weighted` to see how
+        # much your weighting curve is shifting things; against
+        # `diffusion/loss_applied` to see the full pipeline effect.
         self._last_diffusion_loss: Optional[float] = None
+        self._last_diffusion_loss_weighted: Optional[float] = None
         self._last_diffusion_loss_applied: Optional[float] = None
         self._last_diffusion_loss_bins: Optional[dict] = None
         # Gradient cosine diagnostic: norms of the depth-only and
@@ -192,6 +202,20 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_grad_norm_diffusion: Optional[float] = None
         self._last_grad_norm_depth: Optional[float] = None
         self._last_grad_cos_diff_depth: Optional[float] = None
+        # Gradient-noising metrics. Populated by `_inject_gradient_noise`
+        # only on log_every steps; emitted via `_last_to_metric`.
+        self._last_grad_noise_norm: Optional[float] = None
+        self._last_grad_noise_snr: Optional[float] = None
+        # Weight-noise metric (direct weight perturbation). Populated by
+        # `_inject_weight_noise` on log_every steps; emitted via
+        # `_last_to_metric`.
+        self._last_weight_noise_norm: Optional[float] = None
+        # Fisher-trace diagnostic. Sum of Adam's exp_avg_sq across all
+        # LoRA params — the diagonal of the empirical Fisher information,
+        # which is the standard cheap proxy for diagonal-Hessian trace.
+        # Lower over time vs a baseline = trajectory landing in flatter
+        # basins (Camuto et al. 2020 flat-minima prediction).
+        self._last_fisher_trace: Optional[float] = None
         # Set by `calculate_loss` to the depth-applied loss tensor (pre-detach)
         # whenever the depth-consistency loss contributes this microbatch.
         # Read by the dual-backward block; reset to None each microbatch.
@@ -237,6 +261,7 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_landmark_loss': 'landmark_loss',
             '_last_pure_noise_cos': 'pure_noise_cos',
             '_last_diffusion_loss': 'diffusion_loss',
+            '_last_diffusion_loss_weighted': 'diffusion_loss_weighted',
             '_last_diffusion_loss_applied': 'diffusion_loss_applied',
             '_last_identity_loss_applied': 'identity_loss_applied',
             '_last_landmark_loss_applied': 'landmark_loss_applied',
@@ -259,6 +284,10 @@ class SDTrainer(BaseSDTrainProcess):
             '_last_grad_norm_diffusion': 'grad_norm_diffusion',
             '_last_grad_norm_depth': 'grad_norm_depth',
             '_last_grad_cos_diff_depth': 'grad_cos_diff_depth',
+            '_last_grad_noise_norm': 'grad_noise_norm',
+            '_last_grad_noise_snr': 'grad_noise_snr',
+            '_last_weight_noise_norm': 'weight_noise_norm',
+            '_last_fisher_trace': 'fisher_trace',
             '_last_timestep': 'timestep',
             '_last_id_sim': 'id_sim',
             '_last_id_clean_target': 'id_clean_target',
@@ -442,6 +471,169 @@ class SDTrainer(BaseSDTrainProcess):
         self._last_grad_norm_diffusion = norm_diff
         self._last_grad_norm_depth = norm_dc
         self._last_grad_cos_diff_depth = cos
+
+    def _iter_lora_params_with_grad(self):
+        """Yield every trainable LoRA parameter whose .grad is populated.
+
+        LoRA params carry ``_is_lora=True`` (tagged in LoRAModule.__init__).
+        Skips params whose grad is None — Adafactor and certain accumulation
+        edge cases can leave that empty, and we don't want to noise something
+        the optimizer isn't going to step.
+        """
+        groups = self.params
+        if not groups:
+            return
+        if isinstance(groups[0], dict):
+            iterable = (p for g in groups for p in g.get('params', []))
+        else:
+            iterable = iter(groups)
+        for p in iterable:
+            if not getattr(p, '_is_lora', False):
+                continue
+            if p.grad is None:
+                continue
+            yield p
+
+    def _inject_gradient_noise(self) -> None:
+        """Add Gaussian noise to LoRA gradients between clip and step.
+
+        No-op when gradient_noise.enabled is False. Modes: 'absolute',
+        'relative' (per-param grad RMS scaled), 'neelakantan' (annealed
+        SGLD-style σ_t = eta / (1+step)^gamma). Logs grad/noise SNR and
+        noise norm every ``log_every`` steps so the magnitude can be
+        sanity-checked against the running gradient.
+        """
+        cfg = self.train_config.gradient_noise
+        if not getattr(cfg, 'enabled', False):
+            return
+
+        mode = cfg.mode
+        # Anneal step uses optimizer step count — same as the LR scheduler.
+        step = max(0, int(getattr(self, 'step_num', 0)))
+
+        # Optional metric accumulators. Cheap when log_every == 0.
+        do_log = (
+            cfg.log_every > 0
+            and step % cfg.log_every == 0
+        )
+        grad_sq = 0.0
+        noise_sq = 0.0
+
+        for p in self._iter_lora_params_with_grad():
+            g = p.grad
+            if mode == 'absolute':
+                sigma = float(cfg.sigma)
+            elif mode == 'relative':
+                # per-param grad RMS (matches per-layer scale automatically).
+                rms = float(g.detach().pow(2).mean().clamp_min(1e-30).sqrt())
+                sigma = float(cfg.sigma) * rms
+            elif mode == 'neelakantan':
+                # σ_t = eta / (1 + step) ^ gamma  (Neelakantan et al. 2015)
+                sigma = float(cfg.eta) / max(1.0, (1.0 + step) ** float(cfg.gamma))
+            else:
+                # Unknown mode — silently skip rather than poison the run.
+                return
+
+            if sigma <= 0:
+                continue
+            noise = torch.randn_like(g) * sigma
+            if do_log:
+                grad_sq += float(g.detach().pow(2).sum())
+                noise_sq += float(noise.pow(2).sum())
+            g.add_(noise)
+
+        if do_log:
+            grad_norm = grad_sq ** 0.5
+            noise_norm = noise_sq ** 0.5
+            self._last_grad_noise_norm = noise_norm
+            self._last_grad_noise_snr = (
+                grad_norm / noise_norm if noise_norm > 1e-12 else 0.0
+            )
+
+    def _record_fisher_trace(self) -> None:
+        """Sum Adam's exp_avg_sq across LoRA params — diagonal Fisher trace.
+
+        Adam's `v` buffer is ``EMA(g²)`` per parameter, i.e. the diagonal
+        of the empirical Fisher information matrix. Its sum is the
+        standard cheap proxy for ``Tr(Hessian)`` and a direct flat-vs-
+        sharp basin indicator. Free metric — just sums tensors that
+        already live in the optimizer state.
+
+        Silent no-op when the optimizer doesn't carry ``exp_avg_sq``
+        (SGD, Adafactor, etc.) so this stays safe across optimizer
+        choices. Filters to the ``_is_lora`` tagged subset so the
+        reading isn't diluted by frozen-non-LoRA state.
+        """
+        if self.optimizer is None:
+            return
+        total = 0.0
+        any_seen = False
+        for group in self.optimizer.param_groups:
+            for p in group.get('params', []):
+                if not getattr(p, '_is_lora', False):
+                    continue
+                state = self.optimizer.state.get(p, None)
+                if state is None:
+                    continue
+                v = state.get('exp_avg_sq', None)
+                if v is None:
+                    continue
+                total += float(v.sum())
+                any_seen = True
+        if any_seen:
+            self._last_fisher_trace = total
+
+    def _inject_weight_noise(self) -> None:
+        """Add Gaussian noise directly to LoRA parameter values.
+
+        No-op when ``weight_noise.enabled`` is False. Runs after the
+        optimizer step (and after EMA update, so EMA stays clean). Walks
+        the same ``_is_lora``-tagged param set the gradient-noise
+        injector uses. Modes: 'absolute' (fixed σ), 'relative' (σ =
+        sigma × per-param weight RMS).
+        """
+        cfg = self.train_config.weight_noise
+        if not getattr(cfg, 'enabled', False):
+            return
+
+        mode = cfg.mode
+        step = max(0, int(getattr(self, 'step_num', 0)))
+        do_log = cfg.log_every > 0 and step % cfg.log_every == 0
+        noise_sq = 0.0
+
+        # Iterate every tagged adapter param (gradient may be None here —
+        # post optimizer.zero_grad — so the grad-aware iterator is wrong).
+        groups = self.params
+        if not groups:
+            return
+        if isinstance(groups[0], dict):
+            iterable = (p for g in groups for p in g.get('params', []))
+        else:
+            iterable = iter(groups)
+
+        for p in iterable:
+            if not getattr(p, '_is_lora', False):
+                continue
+            w = p.data
+            if mode == 'absolute':
+                sigma = float(cfg.sigma)
+            elif mode == 'relative':
+                # per-param weight RMS; zero-init params (LoRA-up) get
+                # zero noise until they learn something — feature, not bug.
+                rms = float(w.detach().pow(2).mean().clamp_min(1e-30).sqrt())
+                sigma = float(cfg.sigma) * rms
+            else:
+                return
+
+            if sigma <= 0:
+                continue
+            noise = torch.randn_like(w) * sigma
+            if do_log:
+                noise_sq += float(noise.pow(2).sum())
+            w.add_(noise)
+
+        if do_log:
+            self._last_weight_noise_norm = noise_sq ** 0.5
 
     def _snapshot_metrics_to_buffer(self) -> None:
         """Mirror every freshly-written ``self._last_<attr>`` scalar into
@@ -986,7 +1178,9 @@ class SDTrainer(BaseSDTrainProcess):
                  or _ds_identity or _ds_landmark or _ds_body_prop or _ds_body_shape or _ds_normal)
         ) or (
             self.depth_consistency_config is not None
-            and (self.depth_consistency_config.loss_weight > 0 or _ds_depth)
+            and (self.depth_consistency_config.loss_weight > 0
+                 or _ds_depth
+                 or self.depth_consistency_config.preview_only)
         )
 
         # Load identity loss model (ArcFace + TAESD) if enabled
@@ -1075,7 +1269,9 @@ class SDTrainer(BaseSDTrainProcess):
 
         # Load Depth-Anything-V2 perceptor for depth consistency loss if enabled
         if (self.depth_consistency_config is not None
-                and (self.depth_consistency_config.loss_weight > 0 or _ds_depth)):
+                and (self.depth_consistency_config.loss_weight > 0
+                     or _ds_depth
+                     or self.depth_consistency_config.preview_only)):
             print_acc("DepthConsistency: Loading Depth-Anything-V2 perceptor...")
             self.depth_encoder = DifferentiableDepthEncoder(
                 model_id=self.depth_consistency_config.model_id,
@@ -1208,7 +1404,9 @@ class SDTrainer(BaseSDTrainProcess):
         # depth loss has a true zero-floor target (the cleanest the trainer
         # can produce). Mirrors SDTrainer.py:2865-2890 decode dispatch.
         if (self.depth_consistency_config is not None
-                and (self.depth_consistency_config.loss_weight > 0 or _ds_depth)):
+                and (self.depth_consistency_config.loss_weight > 0
+                     or _ds_depth
+                     or self.depth_consistency_config.preview_only)):
             print_acc("DepthConsistency: Extracting and caching GT depth maps...")
 
             # Pull VAE scaling once; all VAEs we hit (Flux 2, SD, SDXL) expose these.
@@ -2034,9 +2232,14 @@ class SDTrainer(BaseSDTrainProcess):
             if self.sd.is_flow_matching:
                 if self.train_config.linear_timesteps or self.train_config.linear_timesteps2:
                     do_weighted_timesteps = True
-                if self.train_config.timestep_type == "weighted":
+                if self.train_config.timestep_type in ("weighted", "weighted_low", "custom"):
                     # use the noise scheduler to get the weights for the timesteps
                     do_weighted_timesteps = True
+
+            # Capture the truly-raw MSE mean BEFORE the weight multiply, so
+            # `diffusion/loss_raw` reports the actual pre-weight loss.
+            with torch.no_grad():
+                self._last_diffusion_loss = loss.detach().float().mean().item()
 
             # handle linear timesteps and only adjust the weight of the timesteps
             if do_weighted_timesteps:
@@ -2051,6 +2254,11 @@ class SDTrainer(BaseSDTrainProcess):
                 elif len(loss.shape) == 5:
                     timestep_weight = timestep_weight.view(-1, 1, 1, 1, 1).detach()
                 loss = loss * timestep_weight
+            # Capture the post-weight mean here — BEFORE mask multiplication,
+            # gating, and diffusion_loss_weight scaling all distort it. With
+            # do_weighted_timesteps=False this matches diffusion/loss_raw.
+            with torch.no_grad():
+                self._last_diffusion_loss_weighted = loss.detach().float().mean().item()
 
         if self.train_config.do_prior_divergence and prior_pred is not None:
             loss = loss + (torch.nn.functional.mse_loss(pred.float(), prior_pred.float(), reduction="none") * -1.0)
@@ -2156,10 +2364,29 @@ class SDTrainer(BaseSDTrainProcess):
                     )
 
         # apply diffusion loss timestep gating (per-sample, before .mean())
-        if self.train_config.diffusion_loss_min_t > 0.0 or self.train_config.diffusion_loss_max_t < 1.0:
+        # Per-sample bounds (from dataset config) fall back to the global
+        # TrainConfig values when None. Bounds are inclusive on both ends to
+        # preserve the prior global-only semantics.
+        _diff_g_min = self.train_config.diffusion_loss_min_t
+        _diff_g_max = self.train_config.diffusion_loss_max_t
+        _diff_min_list = batch.diffusion_loss_min_t_list
+        _diff_max_list = batch.diffusion_loss_max_t_list
+        _diff_needs_global = _diff_g_min > 0.0 or _diff_g_max < 1.0
+        _diff_needs_per_sample = (
+            any(v is not None for v in _diff_min_list)
+            or any(v is not None for v in _diff_max_list)
+        )
+        if _diff_needs_global or _diff_needs_per_sample:
             t_ratio = timesteps.float() / num_train_ts
-            diff_mask = ((t_ratio >= self.train_config.diffusion_loss_min_t) &
-                         (t_ratio <= self.train_config.diffusion_loss_max_t)).float()
+            _diff_min_vals = torch.tensor(
+                [v if v is not None else _diff_g_min for v in _diff_min_list],
+                device=t_ratio.device, dtype=t_ratio.dtype,
+            )
+            _diff_max_vals = torch.tensor(
+                [v if v is not None else _diff_g_max for v in _diff_max_list],
+                device=t_ratio.device, dtype=t_ratio.dtype,
+            )
+            diff_mask = ((t_ratio >= _diff_min_vals) & (t_ratio <= _diff_max_vals)).float()
             loss = loss * diff_mask
 
         # apply per-sample diffusion loss weight overrides
@@ -2207,10 +2434,9 @@ class SDTrainer(BaseSDTrainProcess):
             norm_std_loss = torch.abs(self.train_config.target_norm_std_value - pred_std).mean()
             loss = loss + norm_std_loss
 
-        # snapshot diffusion loss before identity loss is added
-        # uses raw (un-gated) loss so the metric shows what diffusion loss
-        # would have been even when timestep-gated off
-        self._last_diffusion_loss = raw_diffusion_loss.item()
+        # diffusion/loss_weighted was already captured above, right after the
+        # timestep-weight multiply (before mask, gate, scale). Nothing to do
+        # here; `raw_diffusion_loss` is still used for the per-band bins.
 
         # Auxiliary face losses (identity, landmark) via decoded x0 predictions
         # Evaluated at HIGH noise where x0_pred is a genuine generation.
@@ -2537,9 +2763,15 @@ class SDTrainer(BaseSDTrainProcess):
                         loss = loss + id_applied
                         self._last_identity_loss_applied = id_applied.detach().item()
                     # Gate metrics by per-sample weights so zero-weight datasets
-                    # don't bleed into identity metrics
+                    # don't bleed into identity metrics — but skip the gate when
+                    # identity_metrics is on. That flag is a diagnostic opt-in:
+                    # the user wants to see id_sim_tNN / id_previews across all
+                    # samples regardless of which datasets actually contribute
+                    # loss. Without this, a single dataset overriding to 0
+                    # silences metrics entirely even when global identity_loss
+                    # is active.
                     valid_mask = metric_mask
-                    if _has_per_ds_id_w:
+                    if _has_per_ds_id_w and not self.face_id_config.identity_metrics:
                         valid_mask = valid_mask & (id_weights > 0)
                     with torch.no_grad():
                         if valid_mask.any():
@@ -3324,11 +3556,15 @@ class SDTrainer(BaseSDTrainProcess):
                 [v if v is not None else _dc_cfg.loss_max_t for v in _dc_max_list],
                 device=_dc_t.device, dtype=_dc_t.dtype,
             )
-            _dc_active = (_dc_t > _dc_min) & (_dc_t < _dc_max)
+            # Bounds are inclusive on both ends so a config of
+            # loss_min_t=0, loss_max_t=1 actually covers the full range —
+            # in particular t=1.0 (pure noise) needs to fire when the
+            # user has biased timestep sampling toward the noisy end.
+            _dc_in_band = (_dc_t >= _dc_min) & (_dc_t <= _dc_max)
             # Reg samples don't contribute to depth-consistency loss
             # (they're for prior preservation; their conditioning is
             # stripped, so structural matching to GT is meaningless).
-            _dc_active = _dc_active & (~is_reg_per_sample.to(_dc_active.device))
+            _dc_in_band = _dc_in_band & (~is_reg_per_sample.to(_dc_in_band.device))
             # Per-sample loss-weight override (None inherits global). Samples
             # with effective weight <= 0 are gated out of the active set so
             # they don't waste compute on the depth perceptor.
@@ -3343,9 +3579,24 @@ class SDTrainer(BaseSDTrainProcess):
             if loss_split_diff_depth.any() and _step_is_diffusion:
                 _split_mask = loss_split_diff_depth.to(_dc_eff_w.device, dtype=_dc_eff_w.dtype)
                 _dc_eff_w = _dc_eff_w * (1.0 - _split_mask)
-            _dc_active = _dc_active & (_dc_eff_w > 0)
+            _dc_active = _dc_in_band & (_dc_eff_w > 0)
+            # Preview-only path: when configured, also process samples that
+            # would normally be skipped (loss_weight == 0) so we can render
+            # the depth comparison for diffusion-only or evaluation runs.
+            # Only fires on preview-cadence steps so we don't pay the
+            # perceptor cost every step.
+            _dc_preview_step = (
+                _dc_cfg.preview_every > 0
+                and self.step_num % _dc_cfg.preview_every == 0
+            )
+            _dc_preview_only_active = (
+                _dc_in_band & (_dc_eff_w == 0)
+                if (_dc_cfg.preview_only and _dc_preview_step)
+                else torch.zeros_like(_dc_active)
+            )
+            _dc_any_to_process = _dc_active | _dc_preview_only_active
 
-            if _dc_active.any():
+            if _dc_any_to_process.any():
                 # Recover x0 prediction from model output (same math as the
                 # face-losses block — we duplicate it so depth can run with
                 # no face_id config present).
@@ -3392,6 +3643,21 @@ class SDTrainer(BaseSDTrainProcess):
                     _dc_pixels = (_dc_pixels.float() + 1.0) * 0.5
                 _dc_pixels = _dc_pixels.clamp(0, 1)
 
+                # Optional pre-DA2 Gaussian blur on the pixels feeding the
+                # perceptor. Used to push DA2 toward coarse-shape depth and
+                # away from texture-driven detail when training on blurry/
+                # degraded sources. The same blur is applied at GT-cache
+                # time (cache_depth_gt_embeddings) so pred and GT stay
+                # apples-to-apples. _dc_pixels itself is left untouched so
+                # preview tiles show the actual generator output, not the
+                # blurred version that DA2 sees.
+                _dc_blur_sigma = float(getattr(_dc_cfg, 'pixel_blur_sigma', 0.0) or 0.0)
+                if _dc_blur_sigma > 0:
+                    from toolkit.depth_consistency import gaussian_blur_2d as _dc_blur
+                    _dc_pixels_for_da2 = _dc_blur(_dc_pixels, _dc_blur_sigma)
+                else:
+                    _dc_pixels_for_da2 = _dc_pixels
+
                 # Spatial mask source
                 _dc_masks = None
                 if _dc_cfg.mask_source == 'subject':
@@ -3409,7 +3675,7 @@ class SDTrainer(BaseSDTrainProcess):
                 _dc_grad_sum = 0.0
                 _dc_n = 0
                 for _dc_i in range(_dc_pixels.shape[0]):
-                    if not _dc_active[_dc_i]:
+                    if not _dc_any_to_process[_dc_i]:
                         continue
                     _dc_gt_i = batch.depth_gt_list[_dc_i] if _dc_i < len(batch.depth_gt_list) else None
                     if _dc_gt_i is None:
@@ -3422,38 +3688,58 @@ class SDTrainer(BaseSDTrainProcess):
                         _dc_mask_t = _dc_masks[_dc_i].float().to(_dc_pixels.device)
                         if _dc_mask_t.dim() == 3:
                             _dc_mask_t = _dc_mask_t.squeeze(0)
-                    _dc_loss_i, _dc_ssi_i, _dc_grad_i, _dc_dpred_i, _dc_dgt_i = compute_depth_consistency_loss(
-                        self.depth_encoder,
-                        _dc_pixels[_dc_i:_dc_i + 1],
-                        _dc_gt_t,
-                        _dc_mask_t,
-                        ssi_weight=_dc_cfg.ssi_weight,
-                        grad_weight=_dc_cfg.grad_weight,
-                        grad_scales=_dc_cfg.grad_scales,
-                    )
-                    _dc_total = _dc_total + _dc_loss_i
-                    _dc_weighted_total = _dc_weighted_total + _dc_loss_i * _dc_eff_w[_dc_i]
-                    _dc_ssi_sum += float(_dc_ssi_i)
-                    _dc_grad_sum += float(_dc_grad_i)
-                    _dc_n += 1
+                    # Preview-only samples (loss weight == 0 but we still want
+                    # the comparison image) bypass the autograd graph entirely
+                    # — the perceptor forward runs under no_grad so no extra
+                    # activation memory is held for a backward that never
+                    # happens.
+                    _dc_is_preview_only = bool(_dc_preview_only_active[_dc_i])
+                    if _dc_is_preview_only:
+                        with torch.no_grad():
+                            _dc_loss_i, _dc_ssi_i, _dc_grad_i, _dc_dpred_i, _dc_dgt_i = compute_depth_consistency_loss(
+                                self.depth_encoder,
+                                _dc_pixels_for_da2[_dc_i:_dc_i + 1].detach(),
+                                _dc_gt_t,
+                                _dc_mask_t,
+                                ssi_weight=_dc_cfg.ssi_weight,
+                                grad_weight=_dc_cfg.grad_weight,
+                                grad_scales=_dc_cfg.grad_scales,
+                            )
+                    else:
+                        _dc_loss_i, _dc_ssi_i, _dc_grad_i, _dc_dpred_i, _dc_dgt_i = compute_depth_consistency_loss(
+                            self.depth_encoder,
+                            _dc_pixels_for_da2[_dc_i:_dc_i + 1],
+                            _dc_gt_t,
+                            _dc_mask_t,
+                            ssi_weight=_dc_cfg.ssi_weight,
+                            grad_weight=_dc_cfg.grad_weight,
+                            grad_scales=_dc_cfg.grad_scales,
+                        )
+                        _dc_total = _dc_total + _dc_loss_i
+                        _dc_weighted_total = _dc_weighted_total + _dc_loss_i * _dc_eff_w[_dc_i]
+                        _dc_ssi_sum += float(_dc_ssi_i)
+                        _dc_grad_sum += float(_dc_grad_i)
+                        _dc_n += 1
 
-                    # Per-sample depth loss binned by timestep (0.1 bands) —
-                    # mirrors identity's id_sim_t00..t90 so the dashboard shows
-                    # depth loss evolution per noise level.
-                    if self._last_depth_loss_bins is None:
-                        self._last_depth_loss_bins = {}
-                    _dc_t_val = _dc_t[_dc_i].item()
-                    _dc_bin_start = int(_dc_t_val * 10) / 10.0
-                    _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
-                    self._bin_update(
-                        self._last_depth_loss_bins,
-                        _dc_bin_key,
-                        float(_dc_loss_i),
-                    )
-                    self._record_sample(
-                        'depth_consistency_loss', float(_dc_loss_i),
-                        t=_dc_t_val, idx=_dc_i, batch=batch,
-                    )
+                        # Per-sample depth loss binned by timestep (0.1 bands) —
+                        # mirrors identity's id_sim_t00..t90 so the dashboard shows
+                        # depth loss evolution per noise level. Preview-only
+                        # samples are excluded so the metric reflects only the
+                        # values that actually drive the gradient.
+                        if self._last_depth_loss_bins is None:
+                            self._last_depth_loss_bins = {}
+                        _dc_t_val = _dc_t[_dc_i].item()
+                        _dc_bin_start = int(_dc_t_val * 10) / 10.0
+                        _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
+                        self._bin_update(
+                            self._last_depth_loss_bins,
+                            _dc_bin_key,
+                            float(_dc_loss_i),
+                        )
+                        self._record_sample(
+                            'depth_consistency_loss', float(_dc_loss_i),
+                            t=_dc_t_val, idx=_dc_i, batch=batch,
+                        )
 
                     # Preview: save [GT RGB | GT depth | Pred RGB | Pred depth] every N steps.
                     if (_dc_cfg.preview_every > 0
@@ -3524,9 +3810,13 @@ class SDTrainer(BaseSDTrainProcess):
                 [v if v is not None else _dc_cfg.loss_max_t for v in _dc_max_list],
                 device=_dc_t.device, dtype=_dc_t.dtype,
             )
-            _dc_active = (_dc_t > _dc_min) & (_dc_t < _dc_max)
+            # Bounds are inclusive on both ends so a config of
+            # loss_min_t=0, loss_max_t=1 actually covers the full range —
+            # in particular t=1.0 (pure noise) needs to fire when the
+            # user has biased timestep sampling toward the noisy end.
+            _dc_in_band = (_dc_t >= _dc_min) & (_dc_t <= _dc_max)
             # Reg samples are excluded from the depth loss (see image path).
-            _dc_active = _dc_active & (~is_reg_per_sample.to(_dc_active.device))
+            _dc_in_band = _dc_in_band & (~is_reg_per_sample.to(_dc_in_band.device))
             # Per-sample loss-weight override (see image path).
             _dc_w_list = getattr(batch, 'depth_loss_weight_list', None) or [None] * _dc_t.shape[0]
             _dc_eff_w = torch.tensor(
@@ -3537,9 +3827,25 @@ class SDTrainer(BaseSDTrainProcess):
             if loss_split_diff_depth.any() and _step_is_diffusion:
                 _split_mask = loss_split_diff_depth.to(_dc_eff_w.device, dtype=_dc_eff_w.dtype)
                 _dc_eff_w = _dc_eff_w * (1.0 - _split_mask)
-            _dc_active = _dc_active & (_dc_eff_w > 0)
+            _dc_active = _dc_in_band & (_dc_eff_w > 0)
+            # Preview-only path (see image path comment).
+            _dc_preview_step = (
+                _dc_cfg.preview_every > 0
+                and self.step_num % _dc_cfg.preview_every == 0
+            )
+            _dc_preview_only_active = (
+                _dc_in_band & (_dc_eff_w == 0)
+                if (_dc_cfg.preview_only and _dc_preview_step)
+                else torch.zeros_like(_dc_active)
+            )
+            _dc_any_to_process = _dc_active | _dc_preview_only_active
+            # Pure preview-only step (no sample is contributing to the loss):
+            # wrap the perceptor in no_grad — the chunked forward still pays
+            # one chunk of activation memory either way, but skipping autograd
+            # tracking avoids leaking graph state into the training step.
+            _dc_pure_preview = (not _dc_active.any().item()) and _dc_preview_only_active.any().item()
 
-            if _dc_active.any():
+            if _dc_any_to_process.any():
                 # Lazy-load TAEHV on first video step — keeps image-only runs lean.
                 if self._wan_depth_decoder is None:
                     print_acc("DepthConsistency (video): loading TAEHV tiny decoder...")
@@ -3557,32 +3863,48 @@ class SDTrainer(BaseSDTrainProcess):
                     _dc_x0_pred = None
 
                 if _dc_x0_pred is not None:
-                    # Decode to (B, 3, T, H, W) in [0, 1].
-                    _dc_frames = decode_wan_x0_to_frames(
-                        _dc_x0_pred, self._wan_depth_decoder
-                    )
-                    B_vid, _, T_out, H_out, W_out = _dc_frames.shape
-                    # (B, 3, T, H, W) → (B, T, 3, H, W) → (B*T, 3, H, W).
-                    _dc_flat = _dc_frames.permute(0, 2, 1, 3, 4).reshape(
-                        B_vid * T_out, 3, H_out, W_out
-                    )
-
-                    # Run DA2 on chunks with gradient checkpointing to cap peak
-                    # memory. Chunk size keeps activations bounded regardless of
-                    # video length; grad-ckpt frees them across the wrapping
-                    # VAE+transformer backward.
-                    from torch.utils.checkpoint import checkpoint as _ckpt
-                    _dc_chunk = int(getattr(_dc_cfg, 'frames_per_chunk', 8))
-
-                    def _enc_fn(x):
-                        return self.depth_encoder(x)
-
-                    _dc_depth_chunks = []
-                    for _c in _dc_flat.split(_dc_chunk, dim=0):
-                        _dc_depth_chunks.append(
-                            _ckpt(_enc_fn, _c, use_reentrant=False)
+                    # In pure preview-only mode (no loss-active samples), the
+                    # decoder + perceptor can run under no_grad — we never
+                    # backward, so an autograd graph is dead weight.
+                    from contextlib import nullcontext as _nullctx
+                    _dc_grad_ctx = torch.no_grad() if _dc_pure_preview else _nullctx()
+                    with _dc_grad_ctx:
+                        # Decode to (B, 3, T, H, W) in [0, 1].
+                        _dc_frames = decode_wan_x0_to_frames(
+                            _dc_x0_pred, self._wan_depth_decoder
                         )
-                    _dc_depth_flat = torch.cat(_dc_depth_chunks, dim=0)
+                        B_vid, _, T_out, H_out, W_out = _dc_frames.shape
+                        # (B, 3, T, H, W) → (B, T, 3, H, W) → (B*T, 3, H, W).
+                        _dc_flat = _dc_frames.permute(0, 2, 1, 3, 4).reshape(
+                            B_vid * T_out, 3, H_out, W_out
+                        )
+                        # Optional pre-DA2 blur on the flattened frames. GT
+                        # video depth was cached with the same blur applied
+                        # (cache_video_depth_gt_embeddings), keeping pred and
+                        # GT consistent. _dc_frames is left untouched so the
+                        # animated webp preview shows the actual decoded
+                        # frames, not the blurred perceptor input.
+                        _dc_blur_sigma = float(getattr(_dc_cfg, 'pixel_blur_sigma', 0.0) or 0.0)
+                        if _dc_blur_sigma > 0:
+                            from toolkit.depth_consistency import gaussian_blur_2d as _dc_blur
+                            _dc_flat = _dc_blur(_dc_flat, _dc_blur_sigma)
+
+                        # Run DA2 on chunks with gradient checkpointing to cap peak
+                        # memory. Chunk size keeps activations bounded regardless of
+                        # video length; grad-ckpt frees them across the wrapping
+                        # VAE+transformer backward.
+                        from torch.utils.checkpoint import checkpoint as _ckpt
+                        _dc_chunk = int(getattr(_dc_cfg, 'frames_per_chunk', 8))
+
+                        def _enc_fn(x):
+                            return self.depth_encoder(x)
+
+                        _dc_depth_chunks = []
+                        for _c in _dc_flat.split(_dc_chunk, dim=0):
+                            _dc_depth_chunks.append(
+                                _ckpt(_enc_fn, _c, use_reentrant=False)
+                            )
+                        _dc_depth_flat = torch.cat(_dc_depth_chunks, dim=0)
                     # (B*T, H, W) or (B*T, 1, H, W) — normalize to (B*T, H, W).
                     if _dc_depth_flat.dim() == 4:
                         _dc_depth_flat = _dc_depth_flat.squeeze(1)
@@ -3596,7 +3918,7 @@ class SDTrainer(BaseSDTrainProcess):
                     _dc_preview_b = None
 
                     for _b in range(B_vid):
-                        if not _dc_active[_b]:
+                        if not _dc_any_to_process[_b]:
                             continue
                         _gt_cube = (batch.depth_gt_video_list[_b]
                                     if _b < len(batch.depth_gt_video_list) else None)
@@ -3621,46 +3943,55 @@ class SDTrainer(BaseSDTrainProcess):
                                 align_corners=False,
                             ).squeeze(1)
 
-                        # Per-frame SSI + multi-scale gradient loss. We feed the
-                        # already-extracted generated depth directly via a small
-                        # helper below; compute_depth_consistency_loss re-runs
-                        # the encoder which would double-compute.
-                        from toolkit.depth_consistency import ssi_l1, multiscale_grad_loss
-                        gen_d = _dc_depth[_b]  # (T, H, W)
-                        # Per-frame scalar loss, then mean over T.
-                        ssi_per = []
-                        grad_per = []
-                        for _t in range(T_out):
-                            _s, _, _ = ssi_l1(gen_d[_t], _gt_cube[_t])
-                            ssi_per.append(_s)
-                            grad_per.append(multiscale_grad_loss(
-                                gen_d[_t], _gt_cube[_t], scales=_dc_cfg.grad_scales
-                            ))
-                        ssi_mean = torch.stack(ssi_per).mean()
-                        grad_mean = torch.stack(grad_per).mean()
-                        loss_b = _dc_cfg.ssi_weight * ssi_mean + _dc_cfg.grad_weight * grad_mean
+                        _b_is_preview_only = bool(_dc_preview_only_active[_b])
+                        if not _b_is_preview_only:
+                            # Per-frame SSI + multi-scale gradient loss. We feed the
+                            # already-extracted generated depth directly via a small
+                            # helper below; compute_depth_consistency_loss re-runs
+                            # the encoder which would double-compute.
+                            from toolkit.depth_consistency import ssi_l1, multiscale_grad_loss
+                            gen_d = _dc_depth[_b]  # (T, H, W)
+                            # Per-frame scalar loss, then mean over T. Same
+                            # SSI-align-before-grad trick as the image path:
+                            # apply detached (s, t) to gen_d[_t] so the
+                            # grad-matching term doesn't pick up per-frame
+                            # DA2 output-scale variance in its gradient.
+                            ssi_per = []
+                            grad_per = []
+                            for _t in range(T_out):
+                                _s, _s_align, _t_align = ssi_l1(gen_d[_t], _gt_cube[_t])
+                                ssi_per.append(_s)
+                                _aligned = _s_align[0] * gen_d[_t] + _t_align[0]
+                                grad_per.append(multiscale_grad_loss(
+                                    _aligned, _gt_cube[_t], scales=_dc_cfg.grad_scales
+                                ))
+                            ssi_mean = torch.stack(ssi_per).mean()
+                            grad_mean = torch.stack(grad_per).mean()
+                            loss_b = _dc_cfg.ssi_weight * ssi_mean + _dc_cfg.grad_weight * grad_mean
 
-                        _dc_total = _dc_total + loss_b
-                        _dc_weighted_total = _dc_weighted_total + loss_b * _dc_eff_w[_b]
-                        _dc_ssi_sum += float(ssi_mean.detach())
-                        _dc_grad_sum += float(grad_mean.detach())
-                        _dc_n += 1
+                            _dc_total = _dc_total + loss_b
+                            _dc_weighted_total = _dc_weighted_total + loss_b * _dc_eff_w[_b]
+                            _dc_ssi_sum += float(ssi_mean.detach())
+                            _dc_grad_sum += float(grad_mean.detach())
+                            _dc_n += 1
 
-                        # Per-sample depth loss binned by timestep (0.1 bands).
-                        if self._last_depth_loss_bins is None:
-                            self._last_depth_loss_bins = {}
-                        _dc_b_t_val = _dc_t[_b].item()
-                        _dc_bin_start = int(_dc_b_t_val * 10) / 10.0
-                        _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
-                        self._bin_update(
-                            self._last_depth_loss_bins,
-                            _dc_bin_key,
-                            float(loss_b.detach()),
-                        )
-                        self._record_sample(
-                            'depth_consistency_loss', float(loss_b.detach()),
-                            t=_dc_b_t_val, idx=_b, batch=batch,
-                        )
+                            # Per-sample depth loss binned by timestep (0.1 bands).
+                            # Preview-only samples are excluded so the metric
+                            # reflects only the values driving the gradient.
+                            if self._last_depth_loss_bins is None:
+                                self._last_depth_loss_bins = {}
+                            _dc_b_t_val = _dc_t[_b].item()
+                            _dc_bin_start = int(_dc_b_t_val * 10) / 10.0
+                            _dc_bin_key = f'depth_loss_t{int(_dc_bin_start*100):02d}'
+                            self._bin_update(
+                                self._last_depth_loss_bins,
+                                _dc_bin_key,
+                                float(loss_b.detach()),
+                            )
+                            self._record_sample(
+                                'depth_consistency_loss', float(loss_b.detach()),
+                                t=_dc_b_t_val, idx=_b, batch=batch,
+                            )
                         if _dc_preview_b is None:
                             _dc_preview_b = _b
 
@@ -3676,34 +4007,37 @@ class SDTrainer(BaseSDTrainProcess):
                         self._last_depth_consistency_ssi = _dc_ssi_sum / _dc_n
                         self._last_depth_consistency_grad = _dc_grad_sum / _dc_n
 
-                        # Preview: animated webp [gen_rgb | gen_depth | gt_depth].
-                        _dc_preview_min_t = float(getattr(_dc_cfg, 'preview_min_t', 0.0))
-                        if (_dc_cfg.preview_every > 0
-                                and self.step_num % _dc_cfg.preview_every == 0
-                                and _dc_preview_b is not None
-                                and _dc_t[_dc_preview_b].item() >= _dc_preview_min_t):
-                            try:
-                                _gt_cube_p = batch.depth_gt_video_list[_dc_preview_b].to(
-                                    dtype=torch.float32
-                                )
-                                dc_preview_dir = os.path.join(self.save_root, 'depth_previews')
-                                os.makedirs(dc_preview_dir, exist_ok=True)
-                                _t_val = _dc_t[_dc_preview_b].item()
-                                _vh_px = int(_dc_frames[_dc_preview_b].shape[-2])
-                                _vw_px = int(_dc_frames[_dc_preview_b].shape[-1])
-                                out_path = os.path.join(
-                                    dc_preview_dir,
-                                    f'step{self.step_num:06d}_t{_t_val:.2f}_s{_vw_px}x{_vh_px}.webp'
-                                )
-                                save_video_depth_preview(
-                                    out_path,
-                                    gen_rgb=_dc_frames[_dc_preview_b].permute(1, 0, 2, 3).detach(),
-                                    gen_depth=_dc_depth[_dc_preview_b].detach(),
-                                    gt_depth=_gt_cube_p,
-                                    fps=16,
-                                )
-                            except Exception as e:  # noqa: BLE001
-                                print_acc(f"  video depth preview failed: {e}")
+                    # Preview: animated webp [gen_rgb | gen_depth | gt_depth].
+                    # Lives outside the `_dc_n > 0` gate so pure-preview-only
+                    # steps (preview_only=True with no loss-active samples)
+                    # still save the comparison.
+                    _dc_preview_min_t = float(getattr(_dc_cfg, 'preview_min_t', 0.0))
+                    if (_dc_cfg.preview_every > 0
+                            and self.step_num % _dc_cfg.preview_every == 0
+                            and _dc_preview_b is not None
+                            and _dc_t[_dc_preview_b].item() >= _dc_preview_min_t):
+                        try:
+                            _gt_cube_p = batch.depth_gt_video_list[_dc_preview_b].to(
+                                dtype=torch.float32
+                            )
+                            dc_preview_dir = os.path.join(self.save_root, 'depth_previews')
+                            os.makedirs(dc_preview_dir, exist_ok=True)
+                            _t_val = _dc_t[_dc_preview_b].item()
+                            _vh_px = int(_dc_frames[_dc_preview_b].shape[-2])
+                            _vw_px = int(_dc_frames[_dc_preview_b].shape[-1])
+                            out_path = os.path.join(
+                                dc_preview_dir,
+                                f'step{self.step_num:06d}_t{_t_val:.2f}_s{_vw_px}x{_vh_px}.webp'
+                            )
+                            save_video_depth_preview(
+                                out_path,
+                                gen_rgb=_dc_frames[_dc_preview_b].permute(1, 0, 2, 3).detach(),
+                                gen_depth=_dc_depth[_dc_preview_b].detach(),
+                                gt_depth=_gt_cube_p,
+                                fps=16,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            print_acc(f"  video depth preview failed: {e}")
 
         # E-LatentLPIPS perceptual loss in latent space
         if self.latent_perceptual_model is not None:
@@ -5392,6 +5726,10 @@ class SDTrainer(BaseSDTrainProcess):
                     grad_norm = total_norm_sq ** 0.5
                 else:
                     grad_norm = self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm).item()
+            # Gradient noising — inject Gaussian noise into LoRA gradients
+            # AFTER clip so the clip doesn't eat the noise. No-op when
+            # train_config.gradient_noise.enabled is False.
+            self._inject_gradient_noise()
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
@@ -5402,6 +5740,18 @@ class SDTrainer(BaseSDTrainProcess):
             if self.ema is not None:
                 with self.timer('ema_update'):
                     self.ema.update()
+            # Diagonal-Fisher trace diagnostic — sum of Adam's
+            # exp_avg_sq across LoRA params. Free (just sums existing
+            # tensors). Read BEFORE weight-noise injection so the
+            # value reflects optimizer state from gradients, not from
+            # post-noise wandering.
+            self._record_fisher_trace()
+            # Direct weight perturbation — adds Gaussian noise to LoRA
+            # p.data AFTER ema.update() so the EMA shadow tracks the
+            # (nearly) clean optimizer trajectory while the live weights
+            # are the noisy ones used for next forward. No-op when
+            # train_config.weight_noise.enabled is False.
+            self._inject_weight_noise()
         else:
             # gradient accumulation. Just a place for breakpoint
             pass
@@ -5454,6 +5804,9 @@ class SDTrainer(BaseSDTrainProcess):
         if self._last_diffusion_loss is not None:
             loss_dict['diffusion_loss'] = self._last_diffusion_loss
             self._last_diffusion_loss = None
+        if self._last_diffusion_loss_weighted is not None:
+            loss_dict['diffusion_loss_weighted'] = self._last_diffusion_loss_weighted
+            self._last_diffusion_loss_weighted = None
         if self._last_diffusion_loss_applied is not None:
             loss_dict['diffusion_loss_applied'] = self._last_diffusion_loss_applied
             self._last_diffusion_loss_applied = None
@@ -5468,6 +5821,20 @@ class SDTrainer(BaseSDTrainProcess):
         if self._last_grad_cos_diff_depth is not None:
             loss_dict['grad_cos_diff_depth'] = self._last_grad_cos_diff_depth
             self._last_grad_cos_diff_depth = None
+        # Gradient-noising diagnostics (only populated on log_every steps
+        # when gradient_noise.enabled and gradient_noise.log_every > 0).
+        if self._last_grad_noise_norm is not None:
+            loss_dict['grad_noise_norm'] = self._last_grad_noise_norm
+            self._last_grad_noise_norm = None
+        if self._last_grad_noise_snr is not None:
+            loss_dict['grad_noise_snr'] = self._last_grad_noise_snr
+            self._last_grad_noise_snr = None
+        if self._last_weight_noise_norm is not None:
+            loss_dict['weight_noise_norm'] = self._last_weight_noise_norm
+            self._last_weight_noise_norm = None
+        if self._last_fisher_trace is not None:
+            loss_dict['fisher_trace'] = self._last_fisher_trace
+            self._last_fisher_trace = None
         if self._last_identity_loss_applied is not None:
             loss_dict['identity_loss_applied'] = self._last_identity_loss_applied
             self._last_identity_loss_applied = None

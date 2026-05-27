@@ -153,6 +153,41 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'config.quickstart': {
+    title: 'Quickstart Template',
+    description: (
+      <>
+        Replaces the form with an empirically-validated config recipe. Picking a template overwrites every field except
+        the training name and the first dataset&apos;s folder path, which are preserved so you can apply mid-flow. The
+        Subject Likeness template applies a LoKr + weight-noise + depth-consistency + subject-masking recipe on Flux 2
+        Klein 9B; defaults to the HuggingFace checkpoint so you can run without any local file. Switch back to
+        &quot;Custom (no preset)&quot; to keep your current settings.
+      </>
+    ),
+  },
+  'train.weight_noise': {
+    title: 'Weight Noise',
+    description: (
+      <>
+        Injects Gaussian noise directly into LoRA parameter values after each optimizer step. Biases training toward
+        flatter loss minima and spreads learning across more singular directions of the LoRA factorization, which
+        empirically improves subject likeness and helps the model resist memorization of source-image artifacts. Pairs
+        well with small / single-image datasets where overfitting is the dominant failure mode.
+      </>
+    ),
+  },
+  'train.weight_noise.sigma': {
+    title: 'Sigma',
+    description: (
+      <>
+        Noise scale. In <code>relative</code> mode this is a multiplier on each tensor&apos;s weight RMS, so &quot;0.001
+        = 0.1% per-tensor perturbation per step.&quot; Typical useful range is <strong>0.001 – 0.0017</strong>. Lower
+        values barely do anything; higher values risk noise overpowering the gradient (loss flattens or training
+        diverges). Watch the <code>weight_noise_norm</code> metric to verify a sensible magnitude relative to grad
+        norm.
+      </>
+    ),
+  },
   'train.unload_text_encoder': {
     title: 'Unload Text Encoder',
     description: (

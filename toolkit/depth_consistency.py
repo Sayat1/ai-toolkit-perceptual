@@ -28,6 +28,39 @@ CACHE_VERSION_KEY = "depth_gt_v3"  # v3: GT depth from VAE-encode-then-decode ro
 CACHE_VERSION_VIDEO_KEY = "depth_gt_video_v2"
 
 
+def _blur_cache_suffix(sigma: float) -> str:
+    """Cache-key suffix for pixel_blur_sigma. Empty when sigma <= 0 so
+    existing (unblurred) caches keep their original keys."""
+    if sigma is None or sigma <= 0:
+        return ""
+    return f"_blur{int(round(float(sigma) * 10)):02d}"
+
+
+def gaussian_blur_2d(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Differentiable depthwise Gaussian blur for ``(B, C, H, W)`` tensors.
+
+    Identity passthrough when ``sigma <= 0`` — call sites can wire this
+    behind a config flag without branching. Kernel size is
+    ``2*ceil(3*sigma) + 1``; padding is ``reflect`` to avoid edge darkening.
+    The kernel is built in fp32 and cast to the input dtype so bf16/fp16
+    callers stay numerically safe.
+    """
+    if sigma is None or sigma <= 0:
+        return x
+    import math
+    radius = max(1, int(math.ceil(3.0 * float(sigma))))
+    k = 2 * radius + 1
+    coords = torch.arange(k, device=x.device, dtype=torch.float32) - radius
+    g = torch.exp(-(coords ** 2) / (2.0 * float(sigma) * float(sigma)))
+    g = g / g.sum()
+    kernel_1d = g.view(1, 1, 1, k)
+    kernel_2d = (kernel_1d * kernel_1d.transpose(-1, -2)).to(x.dtype)
+    C = x.shape[1]
+    kernel = kernel_2d.expand(C, 1, k, k).contiguous()
+    x_padded = F.pad(x, (radius, radius, radius, radius), mode="reflect")
+    return F.conv2d(x_padded, kernel, groups=C)
+
+
 def _apply_dataloader_transform(img, file_item):
     """PIL → PIL: mirror dataloader_mixins.load_and_process_image 774-793.
 
@@ -246,8 +279,13 @@ def compute_depth_consistency_loss(
             ).squeeze(1)
         mask = mask.to(d_pred.device, dtype=d_pred.dtype)
 
-    ssi, _, _ = ssi_l1(d_pred, target, mask)
-    grd = multiscale_grad_loss(d_pred, target, mask, scales=grad_scales)
+    ssi, s_align, t_align = ssi_l1(d_pred, target, mask)
+    # Align d_pred to target's scale before grad-matching so per-sample DA2
+    # output magnitude doesn't leak into |∇d_pred − ∇d_gt|. s, t come back
+    # detached from ssi_l1, so the gradient w.r.t. d_pred reduces to a
+    # constant scalar — alignment-fit noise stays out of the backward path.
+    d_pred_aligned = s_align.view(-1, 1, 1) * d_pred + t_align.view(-1, 1, 1)
+    grd = multiscale_grad_loss(d_pred_aligned, target, mask, scales=grad_scales)
     loss = ssi_weight * ssi + grad_weight * grd
     return loss, ssi.detach(), grd.detach(), d_pred.detach(), target.detach()
 
@@ -346,6 +384,8 @@ def cache_depth_gt_embeddings(
         device=device,
     )
 
+    _pix_blur_sigma = float(getattr(config, 'pixel_blur_sigma', 0.0) or 0.0)
+    _blur_sfx = _blur_cache_suffix(_pix_blur_sigma)
     zero_depth_count = 0
 
     for file_item in tqdm(file_items, desc="Caching GT depth maps"):
@@ -354,10 +394,25 @@ def cache_depth_gt_embeddings(
         filename_no_ext = os.path.splitext(os.path.basename(file_item.path))[0]
         cache_path = os.path.join(cache_dir, f"{filename_no_ext}.safetensors")
 
+        # Per-bucket cache key. Multi-resolution training assigns the same
+        # image to different bucket dims across datasets, and the cached
+        # depth values are bucket-dependent (DA2 isn't scale-invariant, and
+        # its preprocess upsamples from bucket pixels). Without bucket
+        # keying, the first dataset's depth_gt gets reused for every other
+        # resolution, silently inflating the loss.
+        # When pixel_blur_sigma > 0, the suffix isolates blurred caches from
+        # sharp ones so users can flip the param without re-extraction.
+        _ch = getattr(file_item, 'crop_height', None)
+        _cw = getattr(file_item, 'crop_width', None)
+        if isinstance(_ch, int) and isinstance(_cw, int) and _ch > 0 and _cw > 0:
+            depth_key = f"depth_gt_{int(_ch)}x{int(_cw)}{_blur_sfx}"
+        else:
+            depth_key = f"depth_gt{_blur_sfx}"
+
         if os.path.exists(cache_path):
             data = load_file(cache_path)
-            if "depth_gt" in data and CACHE_VERSION_KEY in data:
-                file_item.depth_gt = data["depth_gt"].clone()
+            if depth_key in data and CACHE_VERSION_KEY in data:
+                file_item.depth_gt = data[depth_key].clone()
                 continue
 
         # v2: run DA2 on the *dataloader-transformed* pixels so cached depth
@@ -377,6 +432,14 @@ def cache_depth_gt_embeddings(
             with torch.no_grad():
                 arr = vae_roundtrip_fn(arr)
 
+        # Symmetric pre-DA2 blur: matches the live blur applied to x0_pixels
+        # in SDTrainer's depth block. Without this, pred-depth (blurred) and
+        # GT-depth (sharp) would systematically mismatch even at perfect
+        # shape alignment.
+        if _pix_blur_sigma > 0:
+            with torch.no_grad():
+                arr = gaussian_blur_2d(arr, _pix_blur_sigma)
+
         with torch.no_grad():
             depth = encoder(arr)[0].cpu().to(torch.float16)
 
@@ -390,7 +453,7 @@ def cache_depth_gt_embeddings(
         if os.path.exists(cache_path):
             existing = load_file(cache_path)
             save_data = {k: v.clone() for k, v in existing.items()}
-        save_data["depth_gt"] = depth
+        save_data[depth_key] = depth
         save_data[CACHE_VERSION_KEY] = torch.ones(1)
         save_file(save_data, cache_path)
 
@@ -525,6 +588,10 @@ def cache_video_depth_gt_embeddings(
         device=device,
     )
 
+    _pix_blur_sigma = float(getattr(config, 'pixel_blur_sigma', 0.0) or 0.0)
+    _blur_sfx = _blur_cache_suffix(_pix_blur_sigma)
+    video_depth_key = f"depth_gt_video{_blur_sfx}"
+
     for file_item in tqdm(video_items, desc="Caching GT depth (video)"):
         vid_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(vid_dir, "_face_id_cache")
@@ -535,11 +602,11 @@ def cache_video_depth_gt_embeddings(
         if os.path.exists(cache_path):
             data = load_file(cache_path)
             if (
-                "depth_gt_video" in data
+                video_depth_key in data
                 and CACHE_VERSION_VIDEO_KEY in data
-                and (num_frames is None or data["depth_gt_video"].shape[0] == num_frames)
+                and (num_frames is None or data[video_depth_key].shape[0] == num_frames)
             ):
-                file_item.depth_gt_video = data["depth_gt_video"].clone()
+                file_item.depth_gt_video = data[video_depth_key].clone()
                 continue
 
         # Read frames sequentially — cv2's CAP_PROP_FRAME_COUNT over-reports by
@@ -599,11 +666,15 @@ def cache_video_depth_gt_embeddings(
 
         video_tensor = torch.stack(frames)  # (T, 3, H, W)
 
-        # Per-frame depth via DA2, no-grad, batched.
+        # Per-frame depth via DA2, no-grad, batched. Blur (if configured)
+        # is applied per-batch in pixel space so the cached GT depth matches
+        # the live blur on x0_pixels at training time.
         depth_frames: List[torch.Tensor] = []
         with torch.no_grad():
             for start in range(0, video_tensor.shape[0], batch_size):
                 batch = video_tensor[start:start + batch_size].to(device)
+                if _pix_blur_sigma > 0:
+                    batch = gaussian_blur_2d(batch, _pix_blur_sigma)
                 d = encoder(batch)  # (b, H_out, W_out)
                 depth_frames.append(d.detach().cpu().to(torch.float16))
         depth_video = torch.cat(depth_frames, dim=0)  # (T, H_out, W_out)
@@ -618,7 +689,7 @@ def cache_video_depth_gt_embeddings(
                 save_data = {k: v.clone() for k, v in existing.items()}
             except Exception:  # noqa: BLE001 — corrupt cache → rewrite
                 save_data = {}
-        save_data["depth_gt_video"] = depth_video
+        save_data[video_depth_key] = depth_video
         save_data[CACHE_VERSION_VIDEO_KEY] = torch.ones(1)
         save_file(save_data, cache_path)
 

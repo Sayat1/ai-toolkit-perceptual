@@ -35,7 +35,17 @@ class MeanFlowScheduler(FlowMatchEulerDiscreteScheduler):
             # Create linear timesteps from 1000 to 1
             timesteps = torch.linspace(1000, 1, num_timesteps, device="cpu")
 
+            # Low-t-emphasizing weighing curve, mirrors the one in
+            # CustomFlowMatchEulerDiscreteScheduler. Step index 0 corresponds
+            # to t=1000 (noisy) and step index N-1 to t=1 (clean); the
+            # Gaussian is centered at x=N so the peak sits at the low-t end.
+            x = torch.arange(num_timesteps, dtype=torch.float32)
+            y_low = torch.exp(-2 * ((x - num_timesteps) / num_timesteps) ** 2)
+            y_low_shifted = y_low - y_low.min()
+            low_t_weighing = y_low_shifted * (num_timesteps / y_low_shifted.sum())
+
             self.linear_timesteps = timesteps
+            self.low_t_weighing = low_t_weighing
             pass
 
     def get_weights_for_timesteps(
@@ -52,6 +62,14 @@ class MeanFlowScheduler(FlowMatchEulerDiscreteScheduler):
                 [default_weighing_scheme[i] for i in step_indices],
                 device=timesteps.device,
                 dtype=timesteps.dtype,
+            )
+        elif timestep_type == "weighted_low":
+            weights = self.low_t_weighing[step_indices].flatten().to(
+                device=timesteps.device, dtype=timesteps.dtype,
+            )
+        elif timestep_type == "custom" and getattr(self, "custom_curve_weights", None) is not None:
+            weights = self.custom_curve_weights[step_indices].flatten().to(
+                device=timesteps.device, dtype=timesteps.dtype,
             )
 
         return weights
@@ -72,6 +90,15 @@ class MeanFlowScheduler(FlowMatchEulerDiscreteScheduler):
         return sample
 
     def set_train_timesteps(self, num_timesteps, device, **kwargs):
+        timestep_type = kwargs.get('timestep_type', 'linear')
+        custom_curve = kwargs.get('custom_curve', None)
+        if timestep_type == 'custom':
+            from toolkit.timestep_weighing.custom_curve import resolve_curve_weights, resolve_live_curve
+            live_curve = resolve_live_curve(custom_curve, 'weighting')
+            cached_for = getattr(self, "_custom_curve_resolved_for", None)
+            if cached_for is not live_curve or getattr(self, "custom_curve_weights", None) is None:
+                self.custom_curve_weights = resolve_curve_weights(live_curve, num_timesteps).to(device)
+                self._custom_curve_resolved_for = live_curve
         timesteps = torch.linspace(1000, 1, num_timesteps, device=device)
         self.timesteps = timesteps
         return timesteps

@@ -512,7 +512,9 @@ def cache_subject_masks(
     """Extract and cache subject masks for all file items.
 
     Caches each image's masks to:
-        {image_dir}/_face_id_cache/{stem}_subject_masks.safetensors
+        {image_dir}/_face_id_cache/{stem}_subject_masks_{H}x{W}.safetensors
+    (one file per bucket shape — multi-resolution training keeps independent
+    caches per resolution so a 256-bucket mask never clobbers a 512-bucket one.)
 
     Keys: ``person``, ``body``, ``clothing`` (uint8 0/255 at
     ``config.cache_resolution``), plus a version sentinel
@@ -547,7 +549,15 @@ def cache_subject_masks(
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, '_face_id_cache')
         stem = os.path.splitext(os.path.basename(file_item.path))[0]
-        cache_path = os.path.join(cache_dir, f'{stem}_subject_masks.safetensors')
+        # Per-bucket cache filename. With multi-resolution training the same
+        # image lands in different bucket dims across datasets, so the cache
+        # must be keyed by shape — otherwise the first dataset's mask shape
+        # gets loaded for every other resolution's items and torch.stack fails
+        # at collate time.
+        out_h, out_w = _mask_output_hw(file_item, fallback_hw=target_hw)
+        cache_path = os.path.join(
+            cache_dir, f'{stem}_subject_masks_{out_h}x{out_w}.safetensors',
+        )
 
         # ------------------------------------------------------------- cache hit
         if os.path.exists(cache_path):
@@ -599,7 +609,7 @@ def cache_subject_masks(
         # Cache at training-tensor dimensions (crop_w, crop_h) when known.
         # No square downsample — preserves aspect ratio so F.interpolate to
         # the latent grid at training time is a straight resize.
-        out_h, out_w = _mask_output_hw(file_item, fallback_hw=target_hw)
+        # (out_h, out_w computed at the top of the loop for the cache path.)
         person_t = _resize_bool(masks['person'], out_h, out_w)
         body_t = _resize_bool(masks['body'], out_h, out_w)
         clothing_t = _resize_bool(masks['clothing'], out_h, out_w)

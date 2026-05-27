@@ -24,6 +24,7 @@ export const LEGACY_TO_CANONICAL: Record<string, string> = {
 
   // diffusion
   diffusion_loss: 'diffusion/loss_raw',
+  diffusion_loss_weighted: 'diffusion/loss_weighted',
   diffusion_loss_applied: 'diffusion/loss_applied',
 
   // identity
@@ -72,6 +73,9 @@ export const LEGACY_TO_CANONICAL: Record<string, string> = {
   grad_norm_diffusion: 'grad/norm/diffusion',
   grad_norm_depth: 'grad/norm/depth',
   grad_cos_diff_depth: 'grad/cos/diff_depth',
+
+  // sharpness / curvature diagnostic
+  fisher_trace: 'grad/fisher',
 
   // tokens
   face_token_norm: 'tokens/face/norm',
@@ -173,7 +177,7 @@ type SeriesMap = Record<string, LossPoint[]>;
 
 function isGraphableKey(key: string) {
   // treat anything containing "loss", "grad_norm", or "face_token_norm" as a graphable series
-  return /loss|grad_norm|face_token_norm|txt_token_norm|vision_token_norm|body_token_norm|timestep|id_sim|id_clean|shape_sim|bp_sim|bsh_sim|body_shape_cos|body_shape_l1|body_shape_gated|normal_cos|normal_loss|pure_noise|va_level|va_mid|va_edge/i.test(key);
+  return /loss|grad_norm|face_token_norm|txt_token_norm|vision_token_norm|body_token_norm|timestep|id_sim|id_clean|shape_sim|bp_sim|bsh_sim|body_shape_cos|body_shape_l1|body_shape_gated|normal_cos|normal_loss|pure_noise|va_level|va_mid|va_edge|fisher|noise_snr|noise_norm/i.test(key);
 }
 
 export default function useJobLossLog(jobID: string, reloadInterval: null | number = null) {

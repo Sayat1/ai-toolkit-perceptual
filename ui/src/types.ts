@@ -103,7 +103,7 @@ export interface DatasetConfig {
   fps?: number;
   flip_x: boolean;
   flip_y: boolean;
-  num_repeats?: number;
+  num_repeats?: number | number[];
   control_path_1?: string | null;
   control_path_2?: string | null;
   control_path_3?: string | null;
@@ -128,6 +128,8 @@ export interface DatasetConfig {
   vae_anchor_loss_min_t?: number;
   vae_anchor_loss_max_t?: number;
   diffusion_loss_weight?: number;
+  diffusion_loss_min_t?: number;
+  diffusion_loss_max_t?: number;
   face_suppression_weight?: number;
   face_suppression_expand?: number;
   face_suppression_soft?: boolean;
@@ -146,6 +148,17 @@ export interface EMAConfig {
   ema_decay: number;
 }
 
+export interface WeightNoiseConfig {
+  /** Master toggle. When false the injector is a no-op regardless of other fields. */
+  enabled: boolean;
+  /** 'relative' (σ × per-param weight RMS) | 'absolute' (fixed σ everywhere). */
+  mode: 'relative' | 'absolute';
+  /** σ multiplier for 'relative', or fixed σ for 'absolute'. */
+  sigma: number;
+  /** Cadence for emitting the weight_noise_norm metric. 0 disables logging. */
+  log_every: number;
+}
+
 export interface TrainConfig {
   batch_size: number;
   bypass_guidance_embedding?: boolean;
@@ -156,10 +169,19 @@ export interface TrainConfig {
   gradient_checkpointing: boolean;
   noise_scheduler: string;
   timestep_type: string;
+  /** Inlined curve dict when timestep_type === 'custom'. Populated by the
+   *  CustomTimestepCurvePicker on job creation; the trainer evaluates it via
+   *  PCHIP at run time. See toolkit/timestep_weighing/custom_curve.py. */
+  custom_timestep_curve?: { points: { x: number; y: number }[]; normalize?: boolean; sourceName?: string } | null;
+  /** Inlined distribution curve when timestep_type === 'custom_distribution'.
+   *  Same shape as custom_timestep_curve but interpreted as an unnormalized
+   *  PDF — the trainer renormalizes and samples timesteps via inverse CDF. */
+  custom_timestep_distribution?: { points: { x: number; y: number }[]; normalize?: boolean; sourceName?: string } | null;
   content_or_style: string;
   optimizer: string;
   lr: number;
   ema_config?: EMAConfig;
+  weight_noise?: WeightNoiseConfig;
   dtype: string;
   unload_text_encoder: boolean;
   cache_text_embeddings: boolean;

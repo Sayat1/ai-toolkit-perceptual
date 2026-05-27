@@ -344,8 +344,84 @@ class DecoratorConfig:
         self.num_tokens: str = kwargs.get('num_tokens', 4)
 
 
-ContentOrStyleType = Literal['balanced', 'style', 'content']
+ContentOrStyleType = Literal['balanced', 'style', 'content', 'custom']
 LossTarget = Literal['noise', 'source', 'unaugmented', 'differential_noise']
+
+
+class WeightNoiseConfig:
+    """Inject Gaussian noise directly into LoRA parameter values after the
+    optimizer step (Pattern A — drift). Each step does ``p.data += noise``;
+    Adam's loss-minimization corrects the drift over training so the weights
+    wander around the optimizer trajectory inside a bounded ball.
+
+    Lives in ``SDTrainer`` just after ``ema.update()`` so the EMA shadow
+    tracks the (nearly) clean optimizer path while the live training weights
+    are the noisy ones used for the next forward.
+
+    Modes
+    -----
+    - ``absolute``: σ fixed at ``sigma`` everywhere. Use when you know the
+      target perturbation magnitude in absolute terms.
+    - ``relative``: σ = ``sigma`` × per-param weight RMS. Default — adapts
+      to per-tensor scale automatically and gives LoRA-up (init=0) a free
+      pass during early training (zero RMS → zero noise) so it can't
+      destabilize the start.
+
+    Metrics
+    -------
+    Every ``log_every`` steps emits ``weight_noise_norm`` (the Frobenius
+    norm of the injected noise across all tagged params). Pair with the
+    grad_noise_snr if both knobs are on.
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        # 'absolute' | 'relative'
+        self.mode: str = str(kwargs.get('mode', 'relative'))
+        # σ for 'absolute', multiplier for 'relative'.
+        self.sigma: float = float(kwargs.get('sigma', 1e-3))
+        # 0 disables logging.
+        self.log_every: int = int(kwargs.get('log_every', 50))
+
+
+class GradientNoiseConfig:
+    """Inject Gaussian noise into LoRA gradients between clip and step.
+
+    Sits at ``SDTrainer`` ~line 5547, after ``clip_grad_norm_`` and before
+    ``optimizer.step()``. Filters to params tagged ``_is_lora`` so non-LoRA
+    trainable params are untouched. Disabled by default.
+
+    Modes
+    -----
+    - ``absolute``: σ is fixed at ``sigma`` for every step / every param.
+      Simplest; pick σ by looking at typical ``core/grad_norm`` magnitudes.
+    - ``relative``: σ = ``sigma`` × per-param grad RMS, computed before
+      injection. Adapts to per-layer scale automatically (LoRA-up grads
+      are typically orders of magnitude larger than LoRA-down grads).
+    - ``neelakantan``: σ_t = ``eta`` / (1 + step)^``gamma``  — SGLD-style
+      annealed noise from Neelakantan et al. 2015. Paper defaults eta=0.01
+      gamma=0.55.
+
+    Metrics
+    -------
+    Every ``log_every`` steps emits ``grad/noise_norm`` and
+    ``grad/noise_snr = ||grad|| / ||noise||`` (computed on the LoRA
+    subset). SNR << 1 means noise dominates (too much); SNR >> 100 means
+    injection is doing essentially nothing.
+    """
+
+    def __init__(self, **kwargs):
+        self.enabled: bool = bool(kwargs.get('enabled', False))
+        # 'absolute' | 'relative' | 'neelakantan'
+        self.mode: str = str(kwargs.get('mode', 'neelakantan'))
+        # σ for 'absolute', multiplier for 'relative'.
+        self.sigma: float = float(kwargs.get('sigma', 1e-3))
+        # Neelakantan eta (initial scale).
+        self.eta: float = float(kwargs.get('eta', 0.01))
+        # Neelakantan gamma (anneal exponent).
+        self.gamma: float = float(kwargs.get('gamma', 0.55))
+        # 0 disables logging.
+        self.log_every: int = int(kwargs.get('log_every', 50))
 
 
 class TrainConfig:
@@ -525,6 +601,23 @@ class TrainConfig:
         # on the firing step; rest of the training loop is unaffected.
         self.gradient_cosine_log_every: int = int(kwargs.get('gradient_cosine_log_every', 0))
 
+        # Gradient noising — inject Gaussian noise into LoRA params' .grad
+        # between clip_grad_norm_ and optimizer.step(). Biases SGD toward
+        # flatter minima and may help LoRA spread learning across more
+        # singular directions in A@B (mitigating effective-rank collapse).
+        # Disabled by default. See GradientNoiseConfig for mode docs.
+        self.gradient_noise = GradientNoiseConfig(
+            **(kwargs.get('gradient_noise', {}) or {})
+        )
+
+        # Direct weight perturbation — adds Gaussian noise to LoRA
+        # `p.data` after the optimizer step. Closest analog to the
+        # LLM "predict random strings → noise the weights" trick.
+        # Disabled by default. See WeightNoiseConfig.
+        self.weight_noise = WeightNoiseConfig(
+            **(kwargs.get('weight_noise', {}) or {})
+        )
+
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get('pred_scaler', 1.0)
 
@@ -547,7 +640,17 @@ class TrainConfig:
         # adds an additional loss to the network to encourage it output a normalized standard deviation
         self.target_norm_std = kwargs.get('target_norm_std', None)
         self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
-        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step
+        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, weighted_low, custom, one_step
+        # When timestep_type == 'custom', this dict carries the curve inlined
+        # from the UI's saved curve library: { points: [{x,y}], normalize: bool }.
+        # Interpreted as per-step *loss weights* (uniform sampling, weighted loss).
+        self.custom_timestep_curve = kwargs.get('custom_timestep_curve', None)
+        # When content_or_style == 'custom', this dict carries a *distribution*
+        # curve (same { points, normalize } shape) interpreted as an
+        # unnormalized PDF. The trainer renormalizes and draws timestep
+        # indices via multinomial sampling so the model *sees* boosted
+        # regions more often, no loss reweighting.
+        self.custom_timestep_distribution = kwargs.get('custom_timestep_distribution', None)
         self.next_sample_timesteps = kwargs.get('next_sample_timesteps', 8)
         self.linear_timesteps = kwargs.get('linear_timesteps', False)
         self.linear_timesteps2 = kwargs.get('linear_timesteps2', False)
@@ -977,6 +1080,15 @@ class DepthConsistencyConfig:
             'model_id', 'depth-anything/Depth-Anything-V2-Small-hf'
         )
         self.input_size: int = kwargs.get('input_size', 518)
+        # Pre-DA2 Gaussian blur (σ in pixels) on the perceptor input. 0 disables.
+        # Higher σ pushes DA2 toward coarse blob-depth and away from texture-
+        # driven fine detail — useful when training on degraded/blurry sources
+        # where the model's predictions are hazy and fine depth structure is
+        # mostly source noise. Applied symmetrically: live blur on x0_pixels
+        # at train time + same blur on VAE-roundtrip pixels at cache time, so
+        # pred and GT remain apples-to-apples. The cache key incorporates σ
+        # so different values keep independent cached GTs.
+        self.pixel_blur_sigma: float = kwargs.get('pixel_blur_sigma', 0.0)
         # Loss composition (MiDaS formulation)
         self.ssi_weight: float = kwargs.get('ssi_weight', 1.0)
         self.grad_weight: float = kwargs.get('grad_weight', 0.5)
@@ -991,6 +1103,12 @@ class DepthConsistencyConfig:
         # Preview cadence — save a (GT RGB | GT depth | Pred RGB | Pred depth)
         # tile every N steps to save_root/depth_previews/.  0 disables.
         self.preview_every: int = kwargs.get('preview_every', 100)
+        # If True, render depth previews even when the depth loss isn't being
+        # applied (e.g. pure diffusion runs with loss_weight=0). The perceptor
+        # forward runs under no_grad for those samples — no backward, no loss
+        # contribution — purely for visual comparison. The encoder and GT
+        # depth cache are still built up-front, so this is opt-in.
+        self.preview_only: bool = kwargs.get('preview_only', False)
         # Preview only for steps whose t-ratio is >= this value (video path).
         self.preview_min_t: float = kwargs.get('preview_min_t', 0.0)
         # Video path only: frames per DA2 chunk during x0→depth backward. Keeps
@@ -1183,6 +1301,8 @@ class DatasetConfig:
         self.vae_anchor_loss_min_t: Union[float, None] = kwargs.get('vae_anchor_loss_min_t', None)
         self.vae_anchor_loss_max_t: Union[float, None] = kwargs.get('vae_anchor_loss_max_t', None)
         self.diffusion_loss_weight: Union[float, None] = kwargs.get('diffusion_loss_weight', None)
+        self.diffusion_loss_min_t: Union[float, None] = kwargs.get('diffusion_loss_min_t', None)
+        self.diffusion_loss_max_t: Union[float, None] = kwargs.get('diffusion_loss_max_t', None)
         self.face_suppression_weight: Union[float, None] = kwargs.get('face_suppression_weight', None)
         self.face_suppression_expand: Union[float, None] = kwargs.get('face_suppression_expand', None)
         self.face_suppression_soft: Union[bool, None] = kwargs.get('face_suppression_soft', None)
@@ -1269,21 +1389,37 @@ class DatasetConfig:
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
     """
-    This just splits up the datasets by resolutions so you dont have to do it manually
-    :param raw_config:
-    :return:
+    Splits each dataset entry into one entry per resolution so the rest of the
+    pipeline only sees scalar-resolution datasets.
+
+    `num_repeats` may be a scalar (broadcast to every resolution) or a list
+    aligned 1:1 with the resolution list — useful for unbalanced per-bucket
+    sampling (e.g. ``resolution: [256, 512, 768, 1024]`` paired with
+    ``num_repeats: [64, 16, 4, 1]``).
     """
-    # split up datasets by resolutions
     new_config = []
     for dataset in raw_config:
         resolution = dataset.get('resolution', 512)
-        if isinstance(resolution, list):
-            resolution_list = resolution
+        resolution_list = resolution if isinstance(resolution, list) else [resolution]
+
+        num_repeats = dataset.get('num_repeats', 1)
+        if isinstance(num_repeats, list):
+            if len(num_repeats) != len(resolution_list):
+                ident = dataset.get('dataset_path') or dataset.get('folder_path') or '<unknown>'
+                raise ValueError(
+                    f"Dataset {ident!r}: num_repeats list length "
+                    f"({len(num_repeats)}) must match resolution list length "
+                    f"({len(resolution_list)}). Got num_repeats={num_repeats}, "
+                    f"resolution={resolution_list}."
+                )
+            repeats_list = num_repeats
         else:
-            resolution_list = [resolution]
-        for res in resolution_list:
+            repeats_list = [num_repeats] * len(resolution_list)
+
+        for res, reps in zip(resolution_list, repeats_list):
             dataset_copy = dataset.copy()
             dataset_copy['resolution'] = res
+            dataset_copy['num_repeats'] = reps
             new_config.append(dataset_copy)
     return new_config
 

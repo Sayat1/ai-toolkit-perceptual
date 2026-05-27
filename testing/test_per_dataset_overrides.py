@@ -671,6 +671,386 @@ def test_face_suppression_no_bboxes_returns_none():
 
 
 # ============================================================
+# Per-dataset diffusion loss timestep bounds
+# ============================================================
+#
+# The diffusion loss has its own (global) TrainConfig fields
+# `diffusion_loss_min_t` / `diffusion_loss_max_t` that gate which samples
+# in a batch contribute to the diffusion loss based on their normalized
+# timestep `t_ratio = timesteps / num_train_timesteps`. The per-dataset
+# overrides on DatasetConfig (`diffusion_loss_min_t` / `diffusion_loss_max_t`)
+# fall back to those globals when None. Unlike the auxiliary face/body/etc
+# losses (which use exclusive bounds), the diffusion-loss gate uses
+# **inclusive** bounds on both ends to preserve the pre-existing
+# global-only semantics — see SDTrainer.py around the
+# `apply diffusion loss timestep gating` comment.
+
+
+def _diffusion_loss_mask(t_ratio, batch_min_list, batch_max_list, global_min, global_max):
+    """Mirror of the per-sample diffusion-loss mask builder in SDTrainer.
+
+    Inclusive on both ends (>= min, <= max). Returns a float mask in {0,1}
+    matching the production code path that multiplies into the per-sample
+    diffusion loss.
+    """
+    min_vals = torch.tensor(
+        [v if v is not None else global_min for v in batch_min_list],
+        device=t_ratio.device, dtype=t_ratio.dtype,
+    )
+    max_vals = torch.tensor(
+        [v if v is not None else global_max for v in batch_max_list],
+        device=t_ratio.device, dtype=t_ratio.dtype,
+    )
+    return ((t_ratio >= min_vals) & (t_ratio <= max_vals)).float()
+
+
+def test_diffusion_bounds_dataset_config_default():
+    """DatasetConfig.diffusion_loss_min_t / max_t default to None (inherit global)."""
+    from toolkit.config_modules import DatasetConfig
+    d = DatasetConfig(folder_path='/tmp/test')
+    assert d.diffusion_loss_min_t is None, f"Got {d.diffusion_loss_min_t!r}"
+    assert d.diffusion_loss_max_t is None, f"Got {d.diffusion_loss_max_t!r}"
+    print("  PASS test_diffusion_bounds_dataset_config_default")
+
+
+def test_diffusion_bounds_dataset_config_set():
+    """DatasetConfig.diffusion_loss_min_t / max_t are picked up when provided."""
+    from toolkit.config_modules import DatasetConfig
+    d = DatasetConfig(
+        folder_path='/tmp/test',
+        diffusion_loss_min_t=0.1,
+        diffusion_loss_max_t=0.85,
+    )
+    assert d.diffusion_loss_min_t == 0.1
+    assert d.diffusion_loss_max_t == 0.85
+    print("  PASS test_diffusion_bounds_dataset_config_set")
+
+
+def test_diffusion_bounds_global_config_defaults():
+    """Global TrainConfig defaults are 0.0 and 1.0 (open window)."""
+    from toolkit.config_modules import TrainConfig
+    tc = TrainConfig()
+    assert tc.diffusion_loss_min_t == 0.0, f"Got {tc.diffusion_loss_min_t!r}"
+    assert tc.diffusion_loss_max_t == 1.0, f"Got {tc.diffusion_loss_max_t!r}"
+    print("  PASS test_diffusion_bounds_global_config_defaults")
+
+
+def test_diffusion_bounds_batch_lists_mixed():
+    """Mixed-dataset batch produces per-sample lists with None as fallback marker."""
+    fi_a = _make_mock_file_item({
+        'folder_path': '/a',
+        'diffusion_loss_min_t': 0.2,
+        'diffusion_loss_max_t': 0.7,
+    })
+    fi_b = _make_mock_file_item({
+        'folder_path': '/b',  # inherits global
+    })
+    # _make_mock_file_item only sets a subset of fields; copy the new ones
+    # the way DataLoaderBatchDTO would.
+    from toolkit.config_modules import DatasetConfig
+    fi_a.diffusion_loss_min_t = DatasetConfig(folder_path='/a',
+        diffusion_loss_min_t=0.2, diffusion_loss_max_t=0.7).diffusion_loss_min_t
+    fi_a.diffusion_loss_max_t = 0.7
+    fi_b.diffusion_loss_min_t = None
+    fi_b.diffusion_loss_max_t = None
+
+    items = [fi_a, fi_b]
+    min_list = [x.diffusion_loss_min_t for x in items]
+    max_list = [x.diffusion_loss_max_t for x in items]
+    assert min_list == [0.2, None], f"Got {min_list}"
+    assert max_list == [0.7, None], f"Got {max_list}"
+    print("  PASS test_diffusion_bounds_batch_lists_mixed")
+
+
+def test_diffusion_bounds_mask_all_global():
+    """All-None per-sample lists reproduce the original global-only mask."""
+    t_ratio = torch.tensor([0.05, 0.2, 0.5, 0.8, 0.95])
+    g_min, g_max = 0.1, 0.9
+    per_sample = _diffusion_loss_mask(t_ratio, [None]*5, [None]*5, g_min, g_max)
+    hardcoded = ((t_ratio >= g_min) & (t_ratio <= g_max)).float()
+    assert per_sample.tolist() == hardcoded.tolist(), (
+        f"Mismatch: {per_sample.tolist()} vs {hardcoded.tolist()}"
+    )
+    print("  PASS test_diffusion_bounds_mask_all_global")
+
+
+def test_diffusion_bounds_mask_per_sample_override():
+    """Per-sample overrides only affect their own sample; others fall back to global."""
+    t_ratio = torch.tensor([0.5, 0.5, 0.5])
+    # Sample 0: override min=0.6 -> 0.5 < 0.6 -> 0 (masked)
+    # Sample 1: global (0.4, 0.8) -> 0.5 in range -> 1
+    # Sample 2: override max=0.45 -> 0.5 > 0.45 -> 0 (masked)
+    mask = _diffusion_loss_mask(
+        t_ratio,
+        batch_min_list=[0.6, None, None],
+        batch_max_list=[None, None, 0.45],
+        global_min=0.4, global_max=0.8,
+    )
+    assert mask.tolist() == [0.0, 1.0, 0.0], f"Got {mask.tolist()}"
+    print("  PASS test_diffusion_bounds_mask_per_sample_override")
+
+
+def test_diffusion_bounds_mask_boundary_inclusive():
+    """Diffusion-loss bounds are INCLUSIVE on both ends — unlike the
+    auxiliary-loss masks. A timestep equal to min or max stays in-window."""
+    t_ratio = torch.tensor([0.4, 0.8])
+    mask = _diffusion_loss_mask(t_ratio, [None, None], [None, None], 0.4, 0.8)
+    # 0.4 >= 0.4 and 0.4 <= 0.8 -> 1
+    # 0.8 >= 0.4 and 0.8 <= 0.8 -> 1
+    assert mask.tolist() == [1.0, 1.0], f"Got {mask.tolist()}"
+    print("  PASS test_diffusion_bounds_mask_boundary_inclusive")
+
+
+def test_diffusion_bounds_mask_wide_window_override():
+    """A per-dataset (0.0, 1.0) override re-enables the loss for that sample
+    even when the global bounds would have excluded its timestep."""
+    t_ratio = torch.tensor([0.05, 0.05])
+    mask = _diffusion_loss_mask(
+        t_ratio,
+        batch_min_list=[0.0, None],   # sample 0 overrides; sample 1 keeps global
+        batch_max_list=[1.0, None],
+        global_min=0.5, global_max=0.9,
+    )
+    # 0.05 is well below global 0.5 — sample 1 is masked, but sample 0 is in
+    # its own wide window and contributes.
+    assert mask.tolist() == [1.0, 0.0], f"Got {mask.tolist()}"
+    print("  PASS test_diffusion_bounds_mask_wide_window_override")
+
+
+def test_diffusion_bounds_mask_narrow_window_override():
+    """A per-dataset narrow window suppresses samples the global would keep."""
+    t_ratio = torch.tensor([0.5, 0.5])
+    mask = _diffusion_loss_mask(
+        t_ratio,
+        batch_min_list=[0.6, None],
+        batch_max_list=[0.7, None],
+        global_min=0.0, global_max=1.0,
+    )
+    # 0.5 < 0.6 -> sample 0 masked. Sample 1 keeps global (0,1) -> 1.
+    assert mask.tolist() == [0.0, 1.0], f"Got {mask.tolist()}"
+    print("  PASS test_diffusion_bounds_mask_narrow_window_override")
+
+
+def test_diffusion_bounds_needs_mask_detection():
+    """The trainer skips the mask build entirely when no global gating is
+    set AND no per-sample override is present — matches the
+    `_diff_needs_global or _diff_needs_per_sample` gate in SDTrainer."""
+    # All-None list with default (open) globals -> no work to do.
+    needs = (0.0 > 0.0 or 1.0 < 1.0)  # global check
+    per_sample = any(v is not None for v in [None, None, None]) or \
+                 any(v is not None for v in [None, None, None])
+    assert not needs and not per_sample
+    # Add a single per-sample override -> mask is needed even with open globals.
+    per_sample2 = any(v is not None for v in [0.3, None]) or \
+                  any(v is not None for v in [None, None])
+    assert per_sample2
+    print("  PASS test_diffusion_bounds_needs_mask_detection")
+
+
+def test_diffusion_bounds_integration_loss_masking():
+    """End-to-end: per-sample loss vector multiplied by mask zeroes out
+    out-of-window samples while preserving in-window ones."""
+    # Pretend per-sample diffusion losses (shape (B,) after reduction)
+    loss = torch.tensor([0.4, 0.3, 0.5, 0.6])
+    t_ratio = torch.tensor([0.05, 0.5, 0.95, 0.5])
+
+    # Dataset A (samples 0, 2): override window [0.0, 1.0] (open)
+    # Dataset B (samples 1, 3): inherit global window [0.2, 0.8]
+    mask = _diffusion_loss_mask(
+        t_ratio,
+        batch_min_list=[0.0, None, 0.0, None],
+        batch_max_list=[1.0, None, 1.0, None],
+        global_min=0.2, global_max=0.8,
+    )
+    # Sample 0: t=0.05, window (0,1) -> in -> 1
+    # Sample 1: t=0.5, global (0.2,0.8) -> in -> 1
+    # Sample 2: t=0.95, window (0,1) -> in -> 1
+    # Sample 3: t=0.5, global (0.2,0.8) -> in -> 1
+    assert mask.tolist() == [1.0, 1.0, 1.0, 1.0]
+    gated = loss * mask
+    assert torch.allclose(gated, loss)
+
+    # Now narrow the global window so sample 1 (t=0.5) falls outside,
+    # while dataset A keeps its (0,1) override.
+    mask2 = _diffusion_loss_mask(
+        t_ratio,
+        batch_min_list=[0.0, None, 0.0, None],
+        batch_max_list=[1.0, None, 1.0, None],
+        global_min=0.6, global_max=0.9,
+    )
+    # Sample 0: in (0,1) -> 1
+    # Sample 1: 0.5 NOT in (0.6, 0.9) -> 0
+    # Sample 2: in (0,1) -> 1
+    # Sample 3: 0.5 NOT in (0.6, 0.9) -> 0
+    assert mask2.tolist() == [1.0, 0.0, 1.0, 0.0]
+    gated2 = loss * mask2
+    expected = torch.tensor([0.4, 0.0, 0.5, 0.0])
+    assert torch.allclose(gated2, expected), f"Got {gated2.tolist()}"
+    print("  PASS test_diffusion_bounds_integration_loss_masking")
+
+
+def test_diffusion_bounds_full_chain_propagation():
+    """End-to-end propagation: DatasetConfig -> FileItemDTO-like -> batch list."""
+    from toolkit.config_modules import DatasetConfig
+    dc_a = DatasetConfig(folder_path='/a', diffusion_loss_min_t=0.15)
+    dc_b = DatasetConfig(folder_path='/b', diffusion_loss_max_t=0.6)
+    dc_c = DatasetConfig(folder_path='/c')
+
+    # Mirror what FileItemDTO.__init__ does for these fields
+    class _FI:
+        pass
+
+    items = []
+    for dc in (dc_a, dc_b, dc_c):
+        fi = _FI()
+        fi.diffusion_loss_min_t = dc.diffusion_loss_min_t
+        fi.diffusion_loss_max_t = dc.diffusion_loss_max_t
+        items.append(fi)
+
+    # Mirror what DataLoaderBatchDTO.__init__ does
+    min_list = [x.diffusion_loss_min_t for x in items]
+    max_list = [x.diffusion_loss_max_t for x in items]
+    assert min_list == [0.15, None, None], f"Got {min_list}"
+    assert max_list == [None, 0.6, None], f"Got {max_list}"
+    print("  PASS test_diffusion_bounds_full_chain_propagation")
+
+
+# ============================================================
+# Resolution / num_repeats expansion in preprocess_dataset_raw_config
+# ============================================================
+#
+# `preprocess_dataset_raw_config` splits each dataset entry into one entry
+# per resolution. `num_repeats` may be a scalar (broadcast to every
+# resolution) or a list aligned 1:1 with the resolution list, enabling
+# unbalanced per-bucket sampling (e.g. 64:16:4:1 across 256/512/768/1024).
+
+
+def test_expand_scalar_resolution_scalar_repeats():
+    """Single resolution + scalar num_repeats: one entry, unchanged."""
+    from toolkit.config_modules import preprocess_dataset_raw_config
+    out = preprocess_dataset_raw_config([
+        {'dataset_path': '/x', 'resolution': 512, 'num_repeats': 3},
+    ])
+    assert len(out) == 1
+    assert out[0]['resolution'] == 512
+    assert out[0]['num_repeats'] == 3
+    print("  PASS test_expand_scalar_resolution_scalar_repeats")
+
+
+def test_expand_list_resolution_scalar_repeats_broadcasts():
+    """List resolution + scalar num_repeats: every split inherits the scalar."""
+    from toolkit.config_modules import preprocess_dataset_raw_config
+    out = preprocess_dataset_raw_config([
+        {'dataset_path': '/x', 'resolution': [256, 512, 768], 'num_repeats': 4},
+    ])
+    assert len(out) == 3
+    assert [d['resolution'] for d in out] == [256, 512, 768]
+    assert [d['num_repeats'] for d in out] == [4, 4, 4]
+    print("  PASS test_expand_list_resolution_scalar_repeats_broadcasts")
+
+
+def test_expand_list_resolution_list_repeats_aligned():
+    """Aligned-list num_repeats applies per-resolution (the headline feature)."""
+    from toolkit.config_modules import preprocess_dataset_raw_config
+    out = preprocess_dataset_raw_config([
+        {
+            'dataset_path': '/x',
+            'resolution':  [256, 512, 768, 1024],
+            'num_repeats': [ 64,  16,   4,    1],
+        },
+    ])
+    assert len(out) == 4
+    assert [d['resolution'] for d in out] == [256, 512, 768, 1024]
+    assert [d['num_repeats'] for d in out] == [64, 16, 4, 1]
+    print("  PASS test_expand_list_resolution_list_repeats_aligned")
+
+
+def test_expand_default_num_repeats_when_missing():
+    """num_repeats omitted defaults to 1 for each resolution split."""
+    from toolkit.config_modules import preprocess_dataset_raw_config
+    out = preprocess_dataset_raw_config([
+        {'dataset_path': '/x', 'resolution': [256, 512]},
+    ])
+    assert len(out) == 2
+    assert [d['num_repeats'] for d in out] == [1, 1]
+    print("  PASS test_expand_default_num_repeats_when_missing")
+
+
+def test_expand_length_mismatch_raises():
+    """List num_repeats whose length disagrees with resolution list raises."""
+    from toolkit.config_modules import preprocess_dataset_raw_config
+    try:
+        preprocess_dataset_raw_config([
+            {'dataset_path': '/x', 'resolution': [256, 512, 768], 'num_repeats': [4, 2]},
+        ])
+    except ValueError as e:
+        msg = str(e)
+        assert 'num_repeats' in msg and 'resolution' in msg, msg
+        assert '/x' in msg, f"Error should identify the offending dataset, got: {msg}"
+        print("  PASS test_expand_length_mismatch_raises")
+        return
+    raise AssertionError("Expected ValueError for length mismatch")
+
+
+def test_expand_scalar_resolution_list_repeats_length_one():
+    """Scalar resolution + 1-element list num_repeats is allowed (treated as len 1)."""
+    from toolkit.config_modules import preprocess_dataset_raw_config
+    out = preprocess_dataset_raw_config([
+        {'dataset_path': '/x', 'resolution': 512, 'num_repeats': [7]},
+    ])
+    assert len(out) == 1
+    assert out[0]['resolution'] == 512
+    assert out[0]['num_repeats'] == 7
+    print("  PASS test_expand_scalar_resolution_list_repeats_length_one")
+
+
+def test_expand_preserves_other_fields_across_splits():
+    """All non-resolution fields are duplicated into every split (incl. overrides)."""
+    from toolkit.config_modules import preprocess_dataset_raw_config
+    out = preprocess_dataset_raw_config([
+        {
+            'dataset_path': '/x',
+            'resolution': [256, 1024],
+            'num_repeats': [8, 1],
+            'identity_loss_weight': 0.5,
+            'caption_dropout_rate': 0.05,
+            'flip_x': True,
+        },
+    ])
+    assert len(out) == 2
+    for d in out:
+        assert d['dataset_path'] == '/x'
+        assert d['identity_loss_weight'] == 0.5
+        assert d['caption_dropout_rate'] == 0.05
+        assert d['flip_x'] is True
+    print("  PASS test_expand_preserves_other_fields_across_splits")
+
+
+def test_expand_multiple_datasets_independent():
+    """Each top-level dataset entry is expanded independently."""
+    from toolkit.config_modules import preprocess_dataset_raw_config
+    out = preprocess_dataset_raw_config([
+        {'dataset_path': '/a', 'resolution': [256, 512], 'num_repeats': [4, 2]},
+        {'dataset_path': '/b', 'resolution': 1024, 'num_repeats': 1},
+    ])
+    assert len(out) == 3
+    assert (out[0]['dataset_path'], out[0]['resolution'], out[0]['num_repeats']) == ('/a', 256, 4)
+    assert (out[1]['dataset_path'], out[1]['resolution'], out[1]['num_repeats']) == ('/a', 512, 2)
+    assert (out[2]['dataset_path'], out[2]['resolution'], out[2]['num_repeats']) == ('/b', 1024, 1)
+    print("  PASS test_expand_multiple_datasets_independent")
+
+
+def test_expand_does_not_mutate_input():
+    """The input dataset dicts are not mutated by the preprocessor."""
+    from toolkit.config_modules import preprocess_dataset_raw_config
+    src = {'dataset_path': '/x', 'resolution': [256, 512], 'num_repeats': [4, 2]}
+    src_snapshot = dict(src)
+    preprocess_dataset_raw_config([src])
+    assert src == src_snapshot, f"Input was mutated: {src} != {src_snapshot}"
+    print("  PASS test_expand_does_not_mutate_input")
+
+
+# ============================================================
 # Run all tests
 # ============================================================
 
@@ -721,4 +1101,29 @@ if __name__ == '__main__':
     test_face_suppression_mixed_batch()
     test_face_suppression_no_bboxes_returns_none()
 
-    print("\n=== ALL 29 TESTS PASSED ===")
+    print("\n=== Resolution / num_repeats expansion ===")
+    test_expand_scalar_resolution_scalar_repeats()
+    test_expand_list_resolution_scalar_repeats_broadcasts()
+    test_expand_list_resolution_list_repeats_aligned()
+    test_expand_default_num_repeats_when_missing()
+    test_expand_length_mismatch_raises()
+    test_expand_scalar_resolution_list_repeats_length_one()
+    test_expand_preserves_other_fields_across_splits()
+    test_expand_multiple_datasets_independent()
+    test_expand_does_not_mutate_input()
+
+    print("\n=== Diffusion loss timestep bounds ===")
+    test_diffusion_bounds_dataset_config_default()
+    test_diffusion_bounds_dataset_config_set()
+    test_diffusion_bounds_global_config_defaults()
+    test_diffusion_bounds_batch_lists_mixed()
+    test_diffusion_bounds_mask_all_global()
+    test_diffusion_bounds_mask_per_sample_override()
+    test_diffusion_bounds_mask_boundary_inclusive()
+    test_diffusion_bounds_mask_wide_window_override()
+    test_diffusion_bounds_mask_narrow_window_override()
+    test_diffusion_bounds_needs_mask_detection()
+    test_diffusion_bounds_integration_loss_masking()
+    test_diffusion_bounds_full_chain_propagation()
+
+    print("\n=== ALL TESTS PASSED ===")

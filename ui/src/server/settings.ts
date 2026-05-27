@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import { defaultDatasetsFolder, defaultDataRoot, defaultModelsFolder } from '@/paths';
+import { defaultDatasetsFolder, defaultDataRoot, defaultModelsFolder, defaultTimestepCurvesFolder, defaultTimestepDistributionsFolder } from '@/paths';
 import { defaultTrainFolder } from '@/paths';
 import NodeCache from 'node-cache';
 
@@ -82,6 +82,28 @@ export const getModelsRoot = async () => {
   }
   myCache.set(key, modelsPath);
   return modelsPath as string;
+};
+
+export const getTimestepCurvesRoot = async () => {
+  const key = 'TIMESTEP_CURVES_FOLDER';
+  let p = myCache.get(key) as string;
+  if (p) return p;
+  const row = await prisma.settings.findFirst({ where: { key } });
+  p = defaultTimestepCurvesFolder;
+  if (row?.value && row.value !== '') p = row.value;
+  myCache.set(key, p);
+  return p as string;
+};
+
+export const getTimestepDistributionsRoot = async () => {
+  const key = 'TIMESTEP_DISTRIBUTIONS_FOLDER';
+  let p = myCache.get(key) as string;
+  if (p) return p;
+  const row = await prisma.settings.findFirst({ where: { key } });
+  p = defaultTimestepDistributionsFolder;
+  if (row?.value && row.value !== '') p = row.value;
+  myCache.set(key, p);
+  return p as string;
 };
 
 export const getDataRoot = async () => {

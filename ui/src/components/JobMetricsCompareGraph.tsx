@@ -86,6 +86,26 @@ function emaSmoothPoints(points: { step: number; value: number }[], alpha: numbe
   return out;
 }
 
+// Boxcar (rolling) mean over a fixed window. Matches the helper in
+// JobMetricsGraph.tsx — kept duplicated to avoid spinning up a shared
+// chart-utils module just for this one function.
+function rollingMeanPoints<P extends { step: number; value: number }>(
+  points: P[],
+  window: number,
+): P[] {
+  const w = Math.max(1, Math.floor(window));
+  if (w <= 1 || points.length === 0) return points;
+  const out: P[] = new Array(points.length);
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    sum += points[i].value;
+    if (i >= w) sum -= points[i - w].value;
+    const denom = Math.min(i + 1, w);
+    out[i] = { ...points[i], value: sum / denom };
+  }
+  return out;
+}
+
 function formatNum(v: number) {
   if (!Number.isFinite(v)) return '';
   if (Math.abs(v) >= 1000) return v.toFixed(0);
@@ -147,6 +167,7 @@ export default function JobMetricsCompareGraph({ job }: Props) {
   const [smoothing, setSmoothing] = useLocalStorageState(lsKey('smoothing'), 0);
   const [plotStride, setPlotStride] = useLocalStorageState(lsKey('plotStride'), 1);
   const [windowSize, setWindowSize] = useLocalStorageState<number>(lsKey('windowSize'), 0);
+  const [rollingMean, setRollingMean] = useLocalStorageState<number>(lsKey('rollingMean'), 1);
 
   const subsystems = useMemo(() => {
     const set = new Set<string>();
@@ -190,6 +211,9 @@ export default function JobMetricsCompareGraph({ job }: Props) {
         .map(p => ({ step: p.step, value: p.value as number }))
         .filter(p => (useLogScale ? p.value > 0 : true))
         .filter((_, idx) => idx % stride === 0);
+      if (rollingMean > 1) {
+        raw = rollingMeanPoints(raw, rollingMean);
+      }
       if (windowSize > 0 && raw.length > windowSize) {
         raw = raw.slice(raw.length - windowSize);
       }
@@ -197,7 +221,7 @@ export default function JobMetricsCompareGraph({ job }: Props) {
       out[jid] = { raw, smooth };
     }
     return out;
-  }, [metric, selectedJobIDs, seriesByJob, smoothing, plotStride, windowSize, useLogScale]);
+  }, [metric, selectedJobIDs, seriesByJob, smoothing, plotStride, windowSize, rollingMean, useLogScale]);
 
   // Merge into one Recharts-friendly array, indexed by step. Each job
   // gets `${jid}__raw` and `${jid}__smooth` columns.
@@ -556,6 +580,28 @@ export default function JobMetricsCompareGraph({ job }: Props) {
               onChange={e => setPlotStride(Number(e.target.value))}
               className="w-full accent-orange-500"
             />
+          </div>
+
+          <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 md:col-span-2">
+            <div className="flex items-center justify-between mb-1">
+              <label className="block text-xs text-gray-400">Rolling mean window</label>
+              <span className="text-xs text-gray-300">
+                {rollingMean === 1 ? 'off' : `avg of last ${rollingMean.toLocaleString()} pts`}
+              </span>
+            </div>
+            <input
+              type="range"
+              min={1}
+              max={1000}
+              step={1}
+              value={rollingMean}
+              onChange={e => setRollingMean(Number(e.target.value))}
+              className="w-full accent-orange-500"
+            />
+            <div className="mt-2 text-[11px] text-gray-500">
+              Each point becomes the mean of the last N raw points — a stable
+              alternative to epoch averages when epoch size varies.
+            </div>
           </div>
 
           <div className="bg-gray-950 border border-gray-800 rounded-lg p-3 md:col-span-2">

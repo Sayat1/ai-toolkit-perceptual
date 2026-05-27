@@ -1,21 +1,27 @@
 # Perceptual LoRA Toolkit
 
-An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds **perceptual anchoring** to LoRA training. The idea is straightforward: instead of training only on per-pixel match against your dataset, you also tell the LoRA to match specific properties of those images using pre-trained vision models. There's an anchor for depth (the geometric structure of a scene), one for facial identity, one for body proportions, and a face-suppression option for when you don't want faces baked in at all. The depth anchor is the most useful one in practice. It lets the LoRA pick up the shapes in your dataset without locking in the colors, textures, or lighting, so trained models stay sharper on small datasets and generalize better to new prompts.
+An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) that adds two layers of regularization to LoRA training:
+
+1. **Perceptual anchoring**: train against frozen vision models (depth, identity, body proportions) instead of only per-pixel loss, so the LoRA picks up shape and identity without baking in source artifacts. The depth anchor is the most useful one in practice; it lets the LoRA pick up the shapes in your dataset without locking in the colors, textures, or lighting.
+2. **Weight noising**: inject small Gaussian noise into LoRA parameter values at each optimizer step. Biases training toward flat loss minima, spreads learning across more singular directions of the LoRA factorization (measured **+20% stable rank** on Flux 2 Klein 9B at matched training settings), and reliably reduces memorization on small / single-image datasets where standard training overcooks or diverges.
+
+These can be used independently or together. Weight noising is the bigger practical win for subject-likeness LoRAs; perceptual anchoring is the bigger win when you need geometric/structural control.
 
 **Supported models:** SDXL, FLUX.2 Klein 9B
 
 ## Contents
 
 - [Perceptual Anchoring](#perceptual-anchoring): depth, identity, body, face suppression
+- [Weight Noising](#weight-noising): per-step Gaussian perturbation of LoRA weights
 - [Auto-Masking](#auto-masking): body / clothing / subject masks for region-weighted loss
 - [Reg Dataset Semantics](#reg-dataset-semantics): how reg samples are treated in this extension
 - [Training Metrics](#training-metrics): what gets logged each step
 - [Training Previews](#training-previews): what each anchor saves to disk
 - [Dataset-Tools UI](#dataset-tools-ui): preflight passes for masks, depth, faces
+- [Quickstart Templates](#quickstart-templates): UI presets for validated configs
 - [Examples](#examples)
   - [Sketchwave Style (single-image style LoRA)](#example-sketchwave-style-single-image-style-lora)
   - [Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
-  - [Handsome Squidward (single-image LoRA)](#example-handsome-squidward-single-image-lora)
 - [Configuration Reference](#configuration-reference): every extension-specific config option
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
 - [Installation](#installation)
@@ -166,6 +172,56 @@ datasets:
 
 See `config/examples/train_lora_flux_identity_24gb.yaml` for a complete example.
 
+## Weight Noising
+
+A small Gaussian perturbation is added to LoRA parameter **values** after each optimizer step (`p.data += σ · randn`, filtered to LoRA-tagged params only). This is **not** gradient noise; the noise hits the weights themselves, not the gradient.
+
+The technique sits between classical weight noise (Graves 2011) and the SAM/SGLD family, but is gradient-free and runs as a few lines in the optimizer loop. It pairs particularly well with the depth anchor on small datasets, but works on its own too. Even with diffusion loss alone, weight noise reliably produces better subject likeness and resists the overcooking failure mode that standard LoRA training falls into on tiny datasets.
+
+### What it does
+
+- **Pushes training toward flat loss minima.** Standard expected-loss expansion adds a `½ σ² · Tr(H)` flat-minima penalty (Camuto et al. NeurIPS 2020). Verified empirically via the `grad/fisher` metric (diagonal-Fisher trace, which proxies `Tr(H)`); the curve trends down vs the unperturbed baseline.
+- **Spreads learning across the LoRA's rank budget.** Measured **+20% stable rank**, **+12% participation ratio** on a 112-module LoKr trained on Flux 2 Klein 9B at matched step count. Frobenius norm barely moves (+2%), ruling out weight inflation; the same energy is just distributed across more singular directions. This is the LoRA-specific manifestation of the flat-minima bias and is probably the biggest reason the technique works.
+- **Resists memorization on small datasets.** Single-image runs converge reliably where the same config without noise overcooks or diverges. The model exhibits a "self-healing" property in this regime: weights can briefly diverge into a worse basin and recover, because no single singular direction is load-bearing.
+
+### Recommended starting config
+
+```yaml
+train:
+  weight_noise:
+    enabled: true
+    mode: relative
+    sigma: 0.00125     # 0.001 – 0.0017 is the typical useful range
+    log_every: 50
+```
+
+### Modes
+
+- **`relative`** (default): `σ_per_param = sigma × ‖w‖_RMS`. Adapts automatically to per-layer scale, which matters because LoRA layers can have very different gradient/weight magnitudes (LoRA-up vs LoRA-down, attention vs MLP). LoRA-up params (init=0) get no noise until they learn something, so early training is safe by construction.
+- **`absolute`**: fixed σ everywhere. Use when you've calibrated a specific magnitude target across all layers.
+
+### Scaling rules
+
+The effective regularization depends on the Langevin temperature `σ² / lr`. Increasing batch size or LR proportionally weakens the noise's effect; smaller datasets need higher σ to preserve constant per-image regularization. Heuristics:
+
+- **Dataset size**: σ ∝ 1 / √N_effective. Smaller dataset → higher σ.
+- **Batch size**: σ ∝ √B. Larger batch → higher σ.
+- **LR**: σ should decay at least as fast as √lr if you want explore-early-exploit-late dynamics.
+
+Reference points: single-image dataset σ ≈ 0.003–0.005; 50-image dataset σ ≈ 0.002; 500-image diverse dataset σ ≈ 0.001 or skip.
+
+### Metrics
+
+- **`weight_noise_norm`**: Frobenius norm of the injected noise per logged step. In relative mode this grows with the LoRA's weight magnitude during training; that's normal and expected.
+- **`grad/fisher`**: diagonal Fisher trace (sum of Adam's `exp_avg_sq` over LoRA params). Should trend downward over training in a noised run vs flat-or-rising in a baseline.
+
+### Notes
+
+- LoRA / LoKr params only. The implementation filters to network-tagged adapter params, not the base model.
+- Distributed training (DDP/FSDP) not yet tested.
+- The current implementation does noise + Adam; a custom SGD+OU optimizer would save ~25% LoRA-state VRAM but isn't shipped.
+- There's also a parallel `train.gradient_noise.*` block (noise on gradients before optimizer.step rather than on weights after). Same Neelakantan-style modes; weight noise is the empirically stronger of the two.
+
 ## Auto-Masking
 
 Splits each training image into regions (body, clothing, and subject = body ∪ clothing) so different parts of the image can be weighted differently in the loss. Useful for:
@@ -219,6 +275,8 @@ Every active loss is logged so you can see during a run whether each anchor is d
 | `body_proportion_loss` | Pose-proportion error. |
 | `grad_norm` | Total gradient magnitude post-clip. Spikes usually mean a loss explosion. |
 | `grad_norm_diffusion`, `grad_norm_depth`, `grad_cos_diff_depth` | Optional gradient-cosine diagnostic. See below. |
+| `weight_noise_norm` | Frobenius norm of injected weight noise. Only logged when `train.weight_noise.enabled`; cadence set by `log_every`. |
+| `grad/fisher` | Sum of Adam's `exp_avg_sq` across LoRA params; diagonal-Fisher proxy for `Tr(Hessian)`. Drops over training when weight noise biases toward flat minima. Free to compute (just sums optimizer state); always on. |
 
 **Gradient-cosine diagnostic.** When you suspect two anchors are pulling in opposite directions, this measures how aligned their gradients are. Cosine near +1 means they reinforce each other, near 0 means they're independent, negative means they're fighting. Off by default; enable with `train.gradient_cosine_log_every: 50`.
 
@@ -244,6 +302,16 @@ Before training, the web UI provides preflight passes that prepare the cached da
 All three run as non-blocking background jobs. Start them and come back when they're done.
 
 The `scripts/sample_dataset.py` utility builds a smaller dataset directory by sampling N random images (with their captions) from a larger source. Useful for building reg sets, running ablations, or making smoke-test datasets without copying everything.
+
+## Quickstart Templates
+
+The new-job form in the web UI has a **Quickstart Template** selector at the top of the Job card. Picking a template overwrites the current form with a validated config, preserving your training name and dataset folder path so you can apply mid-flow without losing what you've already filled in.
+
+Current templates:
+
+- **Subject Likeness (Flux 2 Klein 9B + Weight Noise)**: the full empirically-validated recipe. LoKr (linear/alpha 32, conv/alpha 16, full-rank, factor 8) + weight noise (relative, σ=0.0125) + depth-consistency + subject masking + multi-bucket (`resolution: [512, 768, 1024]`, `num_repeats: [16, 4, 1]`). AdamW8bit @ lr=5e-5, batch=4, 1200 steps. Defaults `model.name_or_path` to the HuggingFace release (`black-forest-labs/FLUX.2-klein-base-9B`) so the template runs without any local checkpoint.
+
+Templates live in `ui/src/app/jobs/new/quickstarts.ts`; adding new ones is a one-export change. The chosen template name shows in the dropdown label and stays there until you pick another. It's not saved to the config; the form *is* the template after apply.
 
 ## Examples
 
@@ -336,60 +404,6 @@ None of these subjects appear in the training set. The LoRA carries Amano's line
 
 With a style dataset this small, the diffusion loss alone tends to overfit on the specific compositions of the training images; every output starts looking like a slight variation on the same handful of poses and figures. The depth anchor pushes the LoRA toward what's invariant across the artist's work (linework, paper texture, color treatment) and away from what's incidental (this exact figure, in this exact pose, against this exact background). Loss splitting reinforces the separation: the diffusion-step focuses on appearance, the depth-step on structure, and they only really agree on the high-level "this looks like Amano" signal.
 
-### Example: Handsome Squidward (single-image LoRA)
-
-Training a subject LoRA from a single image. One illustration, one caption, and the LoRA learns a character the base model can't reliably reproduce.
-
-Handsome Squidward is a side character from a single SpongeBob SquarePants episode. Flux 2 Klein 9B doesn't reliably reproduce him out of the box; prompts default to regular Squidward or a confused human-squid hybrid. We trained a LoRA on a single official illustration to teach the model what he looks like, then tested whether the trained LoRA could generalize to angles and contexts that don't exist anywhere in the source material.
-
-Dataset layout:
-
-```
-examples/squidward/dataset/
-├── 1.webp     # single training image
-└── 1.txt      # caption
-```
-
-The caption: *"a cartoon illustration of handsome squidward. he is standing confidently with his arms flared and his tentacle-hands on his hips. he is wearing a tight yellow shirt with a brown belt and gold buckle. he has four legs, two on each side close together. his legs are spread apart. there is a logo at the bottom of the frame."*
-
-Full config is at [`examples/squidward/config.yaml`](examples/squidward/config.yaml). Key bits:
-
-- LoKr, linear/alpha 32, conv/alpha 16, full-rank, factor 8.
-- 1200 steps, batch size 1, gradient accumulation 2.
-- 1 image, `num_repeats: 50`.
-- Depth anchor: weight `0.005`, DA2-Large at `input_size: 1400`, `mask_source: none`.
-- Loss splitting on the dataset (`loss_split: diffusion_depth`).
-
-These settings were tuned for the single-image case and likely won't transfer to multi-image training as-is. We're still researching optimal settings for multi-image runs (depth weight, `input_size`, `mask_source`, and loss-split behavior all interact differently once the dataset has variety to draw on).
-
-Each preview tile shows (GT RGB | GT depth | Pred RGB | Pred depth) side by side. At the start of training the predicted depth is unstructured noise; by the end it tracks the GT depth closely.
-
-Early (step 21), `depth_consistency_loss: 26.6`:
-
-![Early preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_early.jpg)
-
-Late (step 1199), `depth_consistency_loss: 1.6`:
-
-![Late preview](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/preview_late.jpg)
-
-The training image is a confident front-three-quarter pose. Generations from the trained LoRA hold the character identity in poses, framings, and contexts that don't exist in the source material:
-
-| | |
-|:---:|:---:|
-| ![Output 1](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/output_1.png) | ![Output 2](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-squidward-v1/output_2.png) |
-
-The first output is a near-direct front view, and there is no front-view reference anywhere in the source material, let alone the dataset. Both outputs maintain the character's distinctive identity (chiseled face, squid morphology, the specific drawn-on aesthetic) while placing him in contexts the LoRA wasn't trained on.
-
-From a single image, per-pixel diffusion MSE alone would just memorize the training photo. The depth anchor adds a structural objective that gets reinforced on the same one image, so the LoRA picks up a 3D-ish understanding of the character's shape that lets it interpolate to unseen angles. Loss splitting keeps the diffusion and depth gradients from interfering with each other, which dramatically reduces the texture burn-in that's the typical failure mode of one-shot LoRAs.
-
-To reproduce:
-
-```bash
-python run.py examples/squidward/config.yaml
-```
-
-Edit `model.name_or_path` in the config to point at your local Flux 2 Klein checkpoint first.
-
 ## Configuration Reference
 
 Every extension-specific config option, grouped by the YAML block it lives in. Defaults shown match what you get if you omit the option entirely.
@@ -474,8 +488,33 @@ Auto-masking pipeline.
 | `reg_weight` | `1.0` | Multiplier on diffusion loss for reg samples. `1.0` (equal pull) is the sane default. Increase to 1.5-2.0 if reg isn't preserving the prior strongly enough. |
 | `loss_split` | autodetect | Global default for the per-dataset `loss_split` knob. When the key is omitted, the trainer turns on `diffusion_depth` automatically for every dataset whose effective depth-consistency loss weight is > 0. Set explicitly to `diffusion_depth` to force on everywhere, or to `null` to force off (back to summed-every-step). Per-dataset `loss_split` always wins. |
 | `gradient_cosine_log_every` | `0` | Diagnostic. Every N optimizer steps, measure `cos(g_diffusion, g_depth)` and log the per-loss gradient norms. `0` disables. Use 50-100 to diagnose anchor conflicts without much overhead. |
+| `diffusion_loss_min_t` / `diffusion_loss_max_t` | `0.0` / `1.0` | Global timestep window for the diffusion loss. Samples outside the window are zeroed. Per-dataset overrides supported (see below). |
 | `min_denoising_steps` | `0` | Lower bound on the timestep sampler (0-999). The training loop only samples from `[min, max]`. Useful for focused training, e.g. `min=700, max=700` to train at one specific noise level. |
 | `max_denoising_steps` | `999` | Upper bound on the timestep sampler. |
+
+### `train.weight_noise.*`
+
+Per-step Gaussian perturbation of LoRA weights (see [Weight Noising](#weight-noising)).
+
+| Option | Default | What it does, when to use it |
+|---|---|---|
+| `enabled` | `false` | Master switch. When `false` the injector is a no-op regardless of other fields. |
+| `mode` | `relative` | `relative` (σ × per-param weight RMS, adapts per-layer) or `absolute` (fixed σ everywhere). |
+| `sigma` | `0.001` | Noise scale. In `relative` mode, a multiplier on each tensor's weight RMS. Typical useful range **0.001 – 0.0017**. Lower values barely do anything; higher risk noise overpowering the gradient. |
+| `log_every` | `50` | Cadence for emitting `weight_noise_norm`. `0` disables logging (still injects). |
+
+### `train.gradient_noise.*`
+
+Per-step Gaussian noise injected into LoRA **gradients** before `optimizer.step()`. Closely related to weight noise but acts on the gradient side; empirically the weaker of the two for LoRA fine-tuning. Includes the SGLD-style Neelakantan annealed mode.
+
+| Option | Default | What it does, when to use it |
+|---|---|---|
+| `enabled` | `false` | Master switch. |
+| `mode` | `neelakantan` | `absolute` (fixed σ), `relative` (σ × per-param grad RMS), or `neelakantan` (`σ_t = eta / (1 + step)^gamma`, annealed). |
+| `sigma` | `1e-3` | Noise scale for `absolute` and `relative` modes. |
+| `eta` | `0.01` | Initial noise scale for `neelakantan` (paper default). |
+| `gamma` | `0.55` | Anneal exponent for `neelakantan` (paper default). |
+| `log_every` | `50` | Cadence for emitting `grad_noise_snr` and `grad_noise_norm`. |
 
 ### Per-dataset overrides (`datasets[].*`)
 
@@ -485,6 +524,10 @@ Every entry in `datasets:` accepts these extension-specific overrides. `null` or
 |---|---|
 | `is_reg` | Mark this dataset as a regularization set. Strips subject conditioning and turns off all perceptual anchors on its samples. |
 | `loss_split` | Per-dataset override of the global `train.loss_split`. Omit (or set `null`) to inherit. Set to `diffusion_depth` to force on for this dataset (alternates diffusion and depth-anchor per optimizer step). Set to `sum` to force off for this dataset (losses sum every step). Per-dataset always wins over the global. |
+| `resolution` | Single int (`512`) or a list (`[256, 512, 768, 1024]`). A list expands into one internal dataset per resolution at load time. |
+| `num_repeats` | Scalar (broadcast to every resolution) or a list aligned 1:1 with `resolution` for per-bucket repeat counts. E.g. `resolution: [256, 512, 768, 1024]` paired with `num_repeats: [64, 16, 4, 1]` biases sampling toward the lower-res buckets while still anchoring higher-res quality. Mismatched list lengths raise a clear error. |
+| `diffusion_loss_weight` | Per-dataset multiplier on the diffusion loss for this dataset. Set to 0 to fully suppress diffusion loss on this set (useful for anchor-only training). |
+| `diffusion_loss_min_t` / `diffusion_loss_max_t` | Per-dataset timestep window for the diffusion loss. Inclusive bounds. Inherits global `train.diffusion_loss_min_t/max_t` when omitted. |
 | `depth_loss_weight` | Per-dataset override of the depth anchor's `loss_weight`. Set to `0` to fully disable the depth anchor for this dataset (skips perceptor compute on its samples). |
 | `depth_loss_min_t` / `depth_loss_max_t` | Per-dataset depth-anchor timestep window. |
 | `depth_model_id` | Per-dataset DA2 variant. Useful if one dataset has unusual geometry that benefits from Large while others stay on Small. |

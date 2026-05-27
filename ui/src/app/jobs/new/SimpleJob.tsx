@@ -1,5 +1,5 @@
 'use client';
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import {
   modelArchs,
   ModelArch,
@@ -13,16 +13,20 @@ import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
 import { objectCopy } from '@/utils/basic';
 import { TextInput, SelectInput, Checkbox, FormGroup, NumberInput, SliderInput } from '@/components/formInputs';
 import Card from '@/components/Card';
+import CustomTimestepCurvePicker from '@/components/CustomTimestepCurvePicker';
 import { X } from 'lucide-react';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
 import SampleControlImage from '@/components/SampleControlImage';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
+import { QUICKSTARTS } from './quickstarts';
 
 type Props = {
   jobConfig: JobConfig;
-  setJobConfig: (value: any, key: string) => void;
+  // Optional key matches useNestedState's signature: when omitted the
+  // entire state is replaced (used by the quickstart-template applier).
+  setJobConfig: (value: any, key?: string) => void;
   status: 'idle' | 'saving' | 'success' | 'error';
   handleSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   runId: string | null;
@@ -45,6 +49,11 @@ export default function SimpleJob({
   gpuList,
   datasetOptions,
 }: Props) {
+  // Quickstart selection is UI-only state — the chosen template is reflected
+  // in the dropdown label but not stored in the saved config (the config IS
+  // the template after apply; the dropdown is just a label for "which preset
+  // shaped this form last").
+  const [selectedQuickstart, setSelectedQuickstart] = useState<string>('custom');
   const modelArch = useMemo(() => {
     return modelArchs.find(a => a.name === jobConfig.config.process[0].model.arch) as ModelArch;
   }, [jobConfig.config.process[0].model.arch]);
@@ -149,6 +158,30 @@ export default function SimpleJob({
       <form onSubmit={handleSubmit} className="space-y-8">
         <div className={topBarClass}>
           <Card title="Job">
+            <SelectInput
+              label="Quickstart Template"
+              docKey="config.quickstart"
+              value={selectedQuickstart}
+              onChange={(value: string) => {
+                if (value === 'custom') {
+                  setSelectedQuickstart('custom');
+                  return;
+                }
+                const tmpl = QUICKSTARTS.find(q => q.id === value);
+                if (!tmpl) return;
+                const ok = window.confirm(
+                  `Apply "${tmpl.label}" template?\n\nThis will overwrite the current config. ` +
+                    `Your training name and dataset folder path will be preserved.`,
+                );
+                if (!ok) return;
+                setJobConfig(tmpl.apply(jobConfig));
+                setSelectedQuickstart(value);
+              }}
+              options={[
+                { value: 'custom', label: 'Custom (no preset)' },
+                ...QUICKSTARTS.map(q => ({ value: q.id, label: q.label })),
+              ]}
+            />
             <TextInput
               label="Training Name"
               value={jobConfig.config.name}
@@ -525,7 +558,19 @@ export default function SimpleJob({
                       { value: 'linear', label: 'Linear' },
                       { value: 'shift', label: 'Shift' },
                       { value: 'weighted', label: 'Weighted' },
+                      { value: 'weighted_low', label: 'Weighted Low' },
+                      { value: 'custom', label: 'Custom Weighting Curve' },
                     ]}
+                  />
+                )}
+                {jobConfig.config.process[0].train.timestep_type === 'custom' &&
+                 !disableSections.includes('train.timestep_type') && (
+                  <CustomTimestepCurvePicker
+                    value={jobConfig.config.process[0].train.custom_timestep_curve ?? null}
+                    onChange={next => setJobConfig(next, 'config.process[0].train.custom_timestep_curve')}
+                    apiBase="/api/timestep-curves"
+                    manageHref="/timestep-curves"
+                    label="Custom Weighting Curve"
                   />
                 )}
                 <SelectInput
@@ -537,8 +582,18 @@ export default function SimpleJob({
                     { value: 'balanced', label: 'Balanced' },
                     { value: 'content', label: 'High Noise' },
                     { value: 'style', label: 'Low Noise' },
+                    { value: 'custom', label: 'Custom Distribution' },
                   ]}
                 />
+                {jobConfig.config.process[0].train.content_or_style === 'custom' && (
+                  <CustomTimestepCurvePicker
+                    value={jobConfig.config.process[0].train.custom_timestep_distribution ?? null}
+                    onChange={next => setJobConfig(next, 'config.process[0].train.custom_timestep_distribution')}
+                    apiBase="/api/timestep-distributions"
+                    manageHref="/timestep-distributions"
+                    label="Custom Distribution"
+                  />
+                )}
                 <SelectInput
                   label="Loss Type"
                   className="pt-2"
@@ -708,6 +763,46 @@ export default function SimpleJob({
                     placeholder="eg. 0.99"
                     min={0}
                   />
+                )}
+
+                <FormGroup label="Weight Noise" className="pt-2" docKey={'train.weight_noise'}>
+                  <Checkbox
+                    label="Enable Weight Noise"
+                    className="pt-1"
+                    checked={jobConfig.config.process[0].train.weight_noise?.enabled || false}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.enabled')}
+                  />
+                </FormGroup>
+                {jobConfig.config.process[0].train.weight_noise?.enabled && (
+                  <>
+                    <SelectInput
+                      label="Mode"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.weight_noise?.mode || 'relative'}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.mode')}
+                      options={[
+                        { value: 'relative', label: 'Relative (σ × per-param weight RMS)' },
+                        { value: 'absolute', label: 'Absolute (fixed σ)' },
+                      ]}
+                    />
+                    <NumberInput
+                      label="Sigma"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.weight_noise?.sigma as number}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.sigma')}
+                      placeholder="0.001 – 0.0017"
+                      min={0}
+                      docKey={'train.weight_noise.sigma'}
+                    />
+                    <NumberInput
+                      label="Log Every"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.weight_noise?.log_every as number}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.weight_noise.log_every')}
+                      placeholder="eg. 50"
+                      min={0}
+                    />
+                  </>
                 )}
 
                 <FormGroup label="Text Encoder Optimizations" className="pt-2">
@@ -1690,14 +1785,60 @@ export default function SimpleJob({
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].network_weight`)}
                         placeholder="eg. 1.0"
                       />
-                      <NumberInput
-                        label="Num Repeats"
-                        value={dataset.num_repeats || 1}
-                        className="pt-2"
-                        onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].num_repeats`)}
-                        placeholder="eg. 1"
-                        docKey={'dataset.num_repeats'}
-                      />
+                      {(() => {
+                        const selectedRes = dataset.resolution ?? [];
+                        const repeatsRaw = dataset.num_repeats;
+                        const scalarFallback = (typeof repeatsRaw === 'number' ? repeatsRaw : 1);
+                        if (selectedRes.length <= 1) {
+                          const scalarValue = Array.isArray(repeatsRaw)
+                            ? (repeatsRaw[0] ?? 1)
+                            : (repeatsRaw ?? 1);
+                          return (
+                            <NumberInput
+                              label="Num Repeats"
+                              value={scalarValue}
+                              className="pt-2"
+                              onChange={value =>
+                                setJobConfig(value, `config.process[0].datasets[${i}].num_repeats`)
+                              }
+                              placeholder="eg. 1"
+                              docKey={'dataset.num_repeats'}
+                            />
+                          );
+                        }
+                        const repeatsArr = Array.isArray(repeatsRaw)
+                          ? selectedRes.map((_, idx) => repeatsRaw[idx] ?? scalarFallback)
+                          : selectedRes.map(() => scalarFallback);
+                        const commit = (next: number[]) => {
+                          const allEqual = next.every(v => v === next[0]);
+                          const value = allEqual ? (next[0] ?? 1) : next;
+                          setJobConfig(value, `config.process[0].datasets[${i}].num_repeats`);
+                        };
+                        return (
+                          <FormGroup
+                            label="Num Repeats (per resolution)"
+                            className="pt-2"
+                            docKey={'dataset.num_repeats'}
+                          >
+                            <div className="grid grid-cols-2 gap-2">
+                              {selectedRes.map((res, idx) => (
+                                <NumberInput
+                                  key={res}
+                                  label={`@ ${res}`}
+                                  value={repeatsArr[idx] ?? 1}
+                                  onChange={value => {
+                                    const next = [...repeatsArr];
+                                    next[idx] = (value as number) ?? 1;
+                                    commit(next);
+                                  }}
+                                  placeholder="eg. 1"
+                                  min={0}
+                                />
+                              ))}
+                            </div>
+                          </FormGroup>
+                        );
+                      })()}
                     </div>
                     <div>
                       <TextInput
@@ -1818,7 +1959,7 @@ export default function SimpleJob({
                       <FormGroup label="Resolutions" className="pt-2">
                         <div className="grid grid-cols-2 gap-2">
                           {[
-                            [256, 512, 768],
+                            [128, 256, 384, 512, 768],
                             [1024, 1280, 1536],
                           ].map(resGroup => (
                             <div key={resGroup[0]} className="space-y-2">
@@ -1828,10 +1969,27 @@ export default function SimpleJob({
                                   label={res.toString()}
                                   checked={dataset.resolution.includes(res)}
                                   onChange={value => {
-                                    const resolutions = dataset.resolution.includes(res)
-                                      ? dataset.resolution.filter(r => r !== res)
-                                      : [...dataset.resolution, res];
+                                    const cur = dataset.resolution;
+                                    const removing = cur.includes(res);
+                                    const resolutions = removing
+                                      ? cur.filter(r => r !== res)
+                                      : [...cur, res];
                                     setJobConfig(resolutions, `config.process[0].datasets[${i}].resolution`);
+                                    if (Array.isArray(dataset.num_repeats)) {
+                                      let nextRepeats: number[];
+                                      if (removing) {
+                                        const removeIdx = cur.indexOf(res);
+                                        nextRepeats = dataset.num_repeats.filter((_, idx) => idx !== removeIdx);
+                                      } else {
+                                        const last = dataset.num_repeats[dataset.num_repeats.length - 1] ?? 1;
+                                        nextRepeats = [...dataset.num_repeats, last];
+                                      }
+                                      const allEqual = nextRepeats.length > 0 && nextRepeats.every(v => v === nextRepeats[0]);
+                                      const valueOut: number | number[] = nextRepeats.length === 0
+                                        ? 1
+                                        : (allEqual ? nextRepeats[0] : nextRepeats);
+                                      setJobConfig(valueOut, `config.process[0].datasets[${i}].num_repeats`);
+                                    }
                                   }}
                                 />
                               ))}
@@ -1851,6 +2009,8 @@ export default function SimpleJob({
                           <div className="text-xs font-medium text-gray-400 mb-1">Diffusion</div>
                           <div className="grid grid-cols-3 gap-2">
                             <NumberInput label="Weight" value={dataset.diffusion_loss_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_weight`)} placeholder="inherit" min={0} />
+                            <NumberInput label="Min t" value={dataset.diffusion_loss_min_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_min_t`)} placeholder="inherit" min={0} max={1} />
+                            <NumberInput label="Max t" value={dataset.diffusion_loss_max_t ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].diffusion_loss_max_t`)} placeholder="inherit" min={0} max={1} />
                             <NumberInput label="Face Suppression" value={dataset.face_suppression_weight ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_weight`)} placeholder="inherit" min={0} max={1} />
                             <NumberInput label="Supp. Expand" value={dataset.face_suppression_expand ?? null} onChange={value => setJobConfig(value === null || value === undefined ? undefined : value, `config.process[0].datasets[${i}].face_suppression_expand`)} placeholder="inherit" min={1.0} max={3.0} />
                           </div>

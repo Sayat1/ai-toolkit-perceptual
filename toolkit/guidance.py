@@ -443,7 +443,8 @@ def get_guided_loss_polarity(
                 1000,
                 device=device,
                 timestep_type=timestep_type,
-                latents=conditional_latents
+                latents=conditional_latents,
+                custom_curve=getattr(train_config, 'custom_timestep_curve', None),
             )
             target_pos = (noise - conditional_latents).detach()
             target_neg = (noise - unconditional_latents).detach()

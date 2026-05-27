@@ -159,6 +159,12 @@ export const defaultJobConfig: JobConfig = {
             use_ema: false,
             ema_decay: 0.99,
           },
+          weight_noise: {
+            enabled: false,
+            mode: 'relative',
+            sigma: 0.00125,
+            log_every: 50,
+          },
           skip_first_sample: false,
           force_first_sample: false,
           disable_sampling: false,
