@@ -2373,6 +2373,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.torch_profiler.start()
             did_oom = False
             loss_dict = None
+            if optimizer_type.endswith("schedulefree"):
+                optimizer.train()
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
@@ -2383,6 +2385,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     did_oom = True
                 else:
                     raise  # not an OOM; surface real errors
+            if optimizer_type.endswith("schedulefree"):
+                optimizer.eval()
             if did_oom:
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:

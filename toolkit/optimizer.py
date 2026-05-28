@@ -1,5 +1,5 @@
 import torch
-
+import ast
 
 def get_optimizer(
         params,
@@ -9,6 +9,13 @@ def get_optimizer(
 ):
     if optimizer_params is None:
         optimizer_params = {}
+    print(optimizer_params)
+    for k,v in optimizer_params.items():
+        try:
+            optimizer_params[k] = ast.literal_eval(v)
+        except (ValueError, SyntaxError):
+            # if it fails, keep the original value
+            optimizer_params[k] = v
     lower_type = optimizer_type.lower()
     if lower_type.startswith("dadaptation"):
         # dadaptation optimizer does not use standard learning rate. 1 is the default value
@@ -40,18 +47,24 @@ def get_optimizer(
         # you can choose weight decay value based on your problem, 0 by default
         optimizer = Prodigy8bit(params, lr=use_lr, eps=1e-6, **optimizer_params)
     elif lower_type.startswith("prodigy"):
-        from prodigyopt import Prodigy
+        if lower_type.endswith("schedulefree"):
+            from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
 
-        print("Using Prodigy optimizer")
-        use_lr = learning_rate
-        if use_lr < 0.1:
-            # dadaptation uses different lr that is values of 0.1 to 1.0. default to 1.0
-            use_lr = 1.0
+            print("Using Prodigy Plus Schedule Free optimizer")
+            optimizer = ProdigyPlusScheduleFree(params, lr=learning_rate, **optimizer_params)
+        else:
+            from prodigyopt import Prodigy
 
-        print(f"Using lr {use_lr}")
-        # let net be the neural network you want to train
-        # you can choose weight decay value based on your problem, 0 by default
-        optimizer = Prodigy(params, lr=use_lr, eps=1e-6, **optimizer_params)
+            print("Using Prodigy optimizer")
+            use_lr = learning_rate
+            if use_lr < 0.1:
+                # dadaptation uses different lr that is values of 0.1 to 1.0. default to 1.0
+                use_lr = 1.0
+
+            print(f"Using lr {use_lr}")
+            # let net be the neural network you want to train
+            # you can choose weight decay value based on your problem, 0 by default
+            optimizer = Prodigy(params, lr=use_lr, eps=1e-6, **optimizer_params)
     elif lower_type == "adam8":
         from toolkit.optimizers.adam8bit import Adam8bit
 

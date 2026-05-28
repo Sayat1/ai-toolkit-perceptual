@@ -5717,7 +5717,7 @@ class SDTrainer(BaseSDTrainProcess):
         grad_norm = None
         if not self.is_grad_accumulation_step:
             # fix this for multi params
-            if self.train_config.optimizer != 'adafactor':
+            if self.train_config.optimizer != 'adafactor' and self.train_config.max_grad_norm != 0.0:
                 if isinstance(self.params[0], dict):
                     total_norm_sq = 0.0
                     for i in range(len(self.params)):
