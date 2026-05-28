@@ -192,7 +192,7 @@ train:
   weight_noise:
     enabled: true
     mode: relative
-    sigma: 0.00125     # 0.001 – 0.0017 is the typical useful range
+    sigma: 0.0125      # 0.01 – 0.017 is the typical useful range
     log_every: 50
 ```
 
@@ -209,7 +209,7 @@ The effective regularization depends on the Langevin temperature `σ² / lr`. In
 - **Batch size**: σ ∝ √B. Larger batch → higher σ.
 - **LR**: σ should decay at least as fast as √lr if you want explore-early-exploit-late dynamics.
 
-Reference points: single-image dataset σ ≈ 0.003–0.005; 50-image dataset σ ≈ 0.002; 500-image diverse dataset σ ≈ 0.001 or skip.
+Reference points: single-image dataset σ ≈ 0.03–0.05; 50-image dataset σ ≈ 0.02; 500-image diverse dataset σ ≈ 0.01 or skip.
 
 ### Metrics
 
@@ -548,7 +548,7 @@ Per-step Gaussian perturbation of LoRA weights (see [Weight Noising](#weight-noi
 |---|---|---|
 | `enabled` | `false` | Master switch. When `false` the injector is a no-op regardless of other fields. |
 | `mode` | `relative` | `relative` (σ × per-param weight RMS, adapts per-layer) or `absolute` (fixed σ everywhere). |
-| `sigma` | `0.001` | Noise scale. In `relative` mode, a multiplier on each tensor's weight RMS. Typical useful range **0.001 – 0.0017**. Lower values barely do anything; higher risk noise overpowering the gradient. |
+| `sigma` | `0.0125` | Noise scale. In `relative` mode, a multiplier on each tensor's weight RMS. Typical useful range **0.01 – 0.017**. Lower values barely do anything; higher risk noise overpowering the gradient. |
 | `log_every` | `50` | Cadence for emitting `weight_noise_norm`. `0` disables logging (still injects). |
 
 ### `train.gradient_noise.*`

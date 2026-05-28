@@ -379,7 +379,7 @@ class WeightNoiseConfig:
         # 'absolute' | 'relative'
         self.mode: str = str(kwargs.get('mode', 'relative'))
         # σ for 'absolute', multiplier for 'relative'.
-        self.sigma: float = float(kwargs.get('sigma', 1e-3))
+        self.sigma: float = float(kwargs.get('sigma', 1.25e-2))
         # 0 disables logging.
         self.log_every: int = int(kwargs.get('log_every', 50))
 
