@@ -306,13 +306,17 @@ The `scripts/sample_dataset.py` utility builds a smaller dataset directory by sa
 
 ## Quickstart Templates
 
-The new-job form in the web UI has a **Quickstart Template** selector at the top of the Job card. Picking a template overwrites the current form with a validated config, preserving your training name and dataset folder path so you can apply mid-flow without losing what you've already filled in.
+The new-job form in the web UI has a **Quickstart Template** selector at the top of the Job card. Picking a template overwrites the current form with a validated config, preserving your training name and dataset folder path so you can apply mid-flow without losing what you've already filled in. Each template also has a matching YAML file under `config/examples/` for CLI use (`python run.py <yaml>`).
 
 Current templates:
 
-- **Subject Likeness (Flux 2 Klein 9B + Weight Noise)**: the full empirically-validated recipe. LoKr (linear/alpha 32, conv/alpha 16, full-rank, factor 8) + weight noise (relative, σ=0.0125) + depth-consistency + subject masking + multi-bucket (`resolution: [512, 768, 1024]`, `num_repeats: [16, 4, 1]`). AdamW8bit @ lr=5e-5, batch=4, 1200 steps. Defaults `model.name_or_path` to the HuggingFace release (`black-forest-labs/FLUX.2-klein-base-9B`) so the template runs without any local checkpoint.
+- **Subject Likeness (Flux 2 Klein 9B + Weight Noise)**: the full empirically-validated recipe. LoKr (linear/alpha 32, conv/alpha 16, full-rank, factor 8) + weight noise (relative, σ=0.0125) + full-image depth-consistency + multi-bucket (`resolution: [512, 768, 1024]`, `num_repeats: [16, 4, 1]`). AdamW8bit @ lr=5e-5, batch=4, 1200 steps. Defaults `model.name_or_path` to the HuggingFace release (`black-forest-labs/FLUX.2-klein-base-9B`) so the template runs without any local checkpoint. Use this when captions describe the full image.
+  - YAML: [`config/examples/subject_likeness_flux2_klein9b.yaml`](config/examples/subject_likeness_flux2_klein9b.yaml)
 
-Templates live in `ui/src/app/jobs/new/quickstarts.ts`; adding new ones is a one-export change. The chosen template name shows in the dropdown label and stays there until you pick another. It's not saved to the config; the form *is* the template after apply.
+- **Subject Likeness, Masked (Flux 2 Klein 9B + Weight Noise)**: same recipe plus subject masking with per-region weights (`background:0`, `clothing:1`, `body:1`) and depth-consistency restricted to the subject mask. Use this when you can be disciplined about captioning only the changeable parts of the character and skipping the background/setting. See the [Tips and Tricks](#tips-and-tricks) section for the rationale.
+  - YAML: [`config/examples/subject_likeness_masked_flux2_klein9b.yaml`](config/examples/subject_likeness_masked_flux2_klein9b.yaml)
+
+Templates live in `ui/src/app/jobs/new/quickstarts.ts`; the YAML files under `config/examples/` mirror them and stay in sync. Adding a new template is a one-export change on the TS side plus a YAML mirror. The chosen template name shows in the dropdown label and stays there until you pick another. It's not saved to the config; the form *is* the template after apply.
 
 ## Tips and Tricks
 

@@ -1,0 +1,188 @@
+# Subject Likeness — Flux 2 Klein 9B + Weight Noise
+#
+# Default Subject Likeness recipe. Caption everything in the image; the LoRA
+# learns the subject's identity from what's consistent across captions and
+# images. Subject masking is off in this template (use the masked variant if
+# you want to caption only the changeable parts).
+#
+# YAML mirror of the "Subject Likeness (Flux 2 Klein 9B + Weight Noise)"
+# quickstart template in ui/src/app/jobs/new/quickstarts.ts. The two stay in
+# sync; this file is the CLI surface (`python run.py <this>`) and the
+# quickstart dropdown is the UI surface.
+#
+# Fill in:
+#   - config.name                                    (your training name)
+#   - config.process[0].datasets[0].folder_path      (path to your images)
+#
+# Optionally swap `model.name_or_path` for a local Flux 2 Klein 9B checkpoint
+# instead of pulling from HuggingFace.
+---
+job: extension
+config:
+  name: ""                                             # FILL IN: training name (folder + filename)
+  process:
+    - type: "diffusion_trainer"
+      training_folder: "output"
+      sqlite_db_path: "./aitk_db.db"
+      device: cuda
+      trigger_word: null
+      performance_log_every: 10
+      network:
+        type: "lokr"
+        linear: 32
+        linear_alpha: 32
+        conv: 16
+        conv_alpha: 16
+        lokr_full_rank: true
+        lokr_factor: 8
+        network_kwargs:
+          ignore_if_contains: []
+      save:
+        dtype: bf16
+        save_every: 25
+        max_step_saves_to_keep: 120
+        save_format: diffusers
+        push_to_hub: false
+      datasets:
+        # Single dataset entry covering 512/768/1024 buckets via the
+        # per-resolution num_repeats list form. 16:4:1 biases learning toward
+        # 512 (faster structural learning, cheaper per step) while still
+        # seeing 768 and 1024 to anchor higher-res fine detail.
+        - folder_path: ""                              # FILL IN: path to training images
+          mask_path: null
+          mask_min_value: 0.1
+          default_caption: ""
+          caption_ext: txt
+          caption_dropout_rate: 0.05
+          cache_latents_to_disk: true
+          is_reg: false
+          network_weight: 1
+          resolution: [512, 768, 1024]
+          controls: []
+          shrink_video_to_frames: true
+          num_frames: 1
+          flip_x: false
+          flip_y: false
+          num_repeats: [16, 4, 1]
+          diffusion_loss_weight: 1
+          depth_loss_weight: 0.005
+          loss_split: sum
+      train:
+        # The headline feature. Gaussian noise on LoRA weights each optimizer
+        # step. sigma=0.0125 in relative mode = 1.25% of per-tensor weight RMS.
+        weight_noise:
+          enabled: true
+          mode: relative
+          sigma: 0.0125
+          log_every: 1
+        max_grad_norm: 1
+        batch_size: 4
+        bypass_guidance_embedding: false
+        steps: 1200
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: flowmatch
+        optimizer: adamw8bit
+        timestep_type: linear
+        content_or_style: balanced
+        optimizer_params:
+          weight_decay: 0.0001
+        unload_text_encoder: false
+        cache_text_embeddings: true
+        lr: 5e-5
+        ema_config:
+          use_ema: false
+          ema_decay: 0.99
+        skip_first_sample: false
+        force_first_sample: true
+        disable_sampling: false
+        dtype: bf16
+        diff_output_preservation: false
+        diff_output_preservation_multiplier: 1
+        diff_output_preservation_class: person
+        switch_boundary_every: 1
+        loss_type: mse
+        diffusion_loss_weight: 1
+        diffusion_loss_max_t: 1
+        diffusion_loss_min_t: 0
+        custom_timestep_distribution: null
+        custom_timestep_curve: null
+        max_denoising_steps: 999
+        min_denoising_steps: 0
+        loss_split: null
+      logging:
+        log_every: 1
+        use_ui_logger: true
+      model:
+        # HuggingFace release. Swap for a local checkpoint path if you have one.
+        name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
+        quantize: true
+        qtype: qfloat8
+        quantize_te: true
+        qtype_te: qfloat8
+        arch: flux2_klein_9b
+        low_vram: false
+        model_kwargs:
+          match_target_res: false
+        layer_offloading: false
+        layer_offloading_text_encoder_percent: 1
+        layer_offloading_transformer_percent: 1
+      sample:
+        sampler: flowmatch
+        sample_every: 100
+        width: 640
+        height: 960
+        samples:
+          - prompt: "a photo of a person"
+        neg: ""
+        seed: 42
+        walk_seed: false
+        guidance_scale: 4
+        sample_steps: 25
+        num_frames: 1
+        fps: 1
+      face_id:
+        enabled: false
+        init_scale: 0.3
+        identity_loss_weight: 0
+        landmark_loss_weight: 0
+        body_proportion_loss_weight: 0
+        body_proportion_loss_min_t: 0.8
+        body_proportion_loss_max_t: 1
+        body_shape_loss_weight: 0
+        body_shape_loss_max_t: 1
+        body_shape_loss_min_t: 0.8
+        identity_loss_min_t: 0
+        identity_loss_max_t: 0.9
+        identity_metrics: false
+        identity_loss_use_average: true
+        identity_loss_min_cos: 0.4
+      depth_consistency:
+        loss_weight: 0.005
+        input_size: 518
+        preview_every: 1
+        # 'none' = full-image depth loss. Switch to 'subject' or 'body' (and
+        # enable subject_mask below) if your captions don't cover everything
+        # worth keeping.
+        mask_source: none
+        loss_max_t: 1
+        model_id: "depth-anything/Depth-Anything-V2-Large-hf"
+        loss_min_t: 0
+        grad_checkpoint: false
+        ssi_weight: 0
+        grad_weight: 1
+        grad_scales: 6
+      subject_mask:
+        # Off by default. Captions are doing the discriminative work; skipping
+        # the mask avoids the SegFormer preflight pass and per-image cache.
+        enabled: false
+        background_loss_weight: 0
+        clothing_loss_weight: 1
+        save_debug_previews: true
+        cache_resolution: 768
+        segformer_res: 768
+meta:
+  name: "[name]"
+  version: "1.0"
