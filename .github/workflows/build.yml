@@ -39,7 +39,10 @@ jobs:
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
 
           if [ "${BRANCH}" = "main" ]; then
-            TAGS="${IMAGE}:${{ steps.version.outputs.version }},${IMAGE}:latest"
+            # :main mirrors :latest as a HEAD-of-default-branch pointer some
+            # tooling reaches for first (e.g. users typing the branch name
+            # they cloned from). Same digest as :latest.
+            TAGS="${IMAGE}:${{ steps.version.outputs.version }},${IMAGE}:latest,${IMAGE}:main"
           else
             TAGS="${IMAGE}:${SAFE_BRANCH}"
           fi
@@ -67,6 +70,17 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Disable in-manifest attestations. docker/build-push-action@v6
+          # defaults to provenance=mode=max, which wraps the pushed tag in
+          # an OCI image index containing an extra unknown/unknown
+          # attestation-manifest entry. Older container runtimes (Runpod's
+          # included) iterate the index, hit that entry's
+          # application/vnd.oci.empty.v1+json payload, and error out with
+          # "unsupported media type". Provenance still gets recorded via
+          # the actions/attest-build-provenance step below — it lives as a
+          # separate sha256-* referrer tag, not inside the image index.
+          provenance: false
+          sbom: false
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
