@@ -1,4 +1,6 @@
 import os
+import shutil
+import tempfile
 from typing import Optional, List, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -258,7 +260,14 @@ class DifferentiableFaceEncoder(nn.Module):
                     f"Install insightface for automatic download: pip install insightface onnxruntime-gpu\n"
                     f"Or manually download the buffalo_l model pack to ~/.insightface/models/"
                 ) from e
-        self.model = onnx2torch.convert(onnx_path)
+        # onnx2torch.safe_shape_inference writes a temp file next to the
+        # source ONNX → PermissionError [Errno 13] on Windows when the
+        # InsightFace model dir has a live handle on the ONNX (Defender
+        # scan, ORT session from auto-download). Staging avoids contention.
+        with tempfile.TemporaryDirectory() as _td:
+            _local_onnx = os.path.join(_td, os.path.basename(onnx_path))
+            shutil.copy2(onnx_path, _local_onnx)
+            self.model = onnx2torch.convert(_local_onnx)
         self.model.eval()
         self.model.requires_grad_(False)
 
