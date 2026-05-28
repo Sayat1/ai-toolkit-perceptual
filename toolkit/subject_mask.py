@@ -544,8 +544,11 @@ def cache_subject_masks(
     # Determine whether we can skip loading the extractor altogether (all cached).
     extractor: Optional[SubjectMaskExtractor] = None
     empty_count = 0
+    cached_count = 0
+    extracted_count = 0
 
-    for file_item in tqdm(file_items, desc="Caching subject masks"):
+    pbar = tqdm(file_items, desc="Caching subject masks")
+    for file_item in pbar:
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, '_face_id_cache')
         stem = os.path.splitext(os.path.basename(file_item.path))[0]
@@ -592,6 +595,8 @@ def cache_subject_masks(
                             tile.save(preview_path)
                         except Exception as e:
                             print(f"  -  Warning: failed to render preview for {stem}: {e}")
+                cached_count += 1
+                pbar.set_postfix(hit=cached_count, miss=extracted_count)
                 continue  # cache hit — no need to run models
 
         # ------------------------------------------------------------- cache miss
@@ -630,6 +635,8 @@ def cache_subject_masks(
             CACHE_VERSION_KEY: torch.ones(1),
         }
         save_file(save_data, cache_path)
+        extracted_count += 1
+        pbar.set_postfix(hit=cached_count, miss=extracted_count)
 
         # Optional: write a 5-panel preview tile for visual inspection.
         # Only if both the flag is on AND a target directory was provided —
@@ -655,5 +662,10 @@ def cache_subject_masks(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    print(
+        f"  -  Subject masks: {cached_count} cache hit"
+        f"{'s' if cached_count != 1 else ''}, "
+        f"{extracted_count} extracted"
+    )
     if empty_count > 0:
         print(f"  -  Warning: empty subject mask for {empty_count}/{len(file_items)} images")
