@@ -12,7 +12,9 @@ Reference: Ranftl et al., "Towards Robust Monocular Depth Estimation"
 
 from __future__ import annotations
 
+import gc
 import os
+import tempfile
 from typing import List, Optional, Tuple
 
 import torch
@@ -26,6 +28,48 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 
 CACHE_VERSION_KEY = "depth_gt_v3"  # v3: GT depth from VAE-encode-then-decode roundtrip pixels (zero-floor target)
 CACHE_VERSION_VIDEO_KEY = "depth_gt_video_v2"
+
+
+def _atomic_save_file(save_data: dict, cache_path: str) -> None:
+    """Windows-safe atomic safetensors write.
+
+    safetensors.save_file uses memory-mapped I/O on Windows. When the same
+    cache file has been read earlier in the same process via load_file, the
+    mmap section can stay live and block a subsequent in-place rewrite,
+    producing OSError 1224 ("user-mapped section open"). Writing to a temp
+    file in the same directory and using os.replace sidesteps that: rename
+    succeeds even when the destination is currently mmap'd.
+    """
+    cache_dir = os.path.dirname(cache_path) or "."
+    os.makedirs(cache_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".tmp_", suffix=".safetensors", dir=cache_dir
+    )
+    os.close(fd)
+    try:
+        save_file(save_data, tmp_path)
+        os.replace(tmp_path, cache_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
+def _load_then_close(cache_path: str) -> dict:
+    """Load a safetensors file and aggressively release the mmap handle.
+
+    Detaches every tensor from the underlying mmap by cloning into a fresh
+    dict, drops the original reference, and forces a GC pass so the Rust
+    side can unmap the file before the caller tries to overwrite it.
+    """
+    existing = load_file(cache_path)
+    copied = {k: v.clone() for k, v in existing.items()}
+    del existing
+    gc.collect()
+    return copied
 
 
 def _blur_cache_suffix(sigma: float) -> str:
@@ -410,7 +454,7 @@ def cache_depth_gt_embeddings(
             depth_key = f"depth_gt{_blur_sfx}"
 
         if os.path.exists(cache_path):
-            data = load_file(cache_path)
+            data = _load_then_close(cache_path)
             if depth_key in data and CACHE_VERSION_KEY in data:
                 file_item.depth_gt = data[depth_key].clone()
                 continue
@@ -448,17 +492,20 @@ def cache_depth_gt_embeddings(
 
         file_item.depth_gt = depth
 
-        os.makedirs(cache_dir, exist_ok=True)
         save_data = {}
         if os.path.exists(cache_path):
-            existing = load_file(cache_path)
-            save_data = {k: v.clone() for k, v in existing.items()}
+            try:
+                save_data = _load_then_close(cache_path)
+            except Exception:  # noqa: BLE001 — corrupt cache → rewrite from scratch
+                save_data = {}
         save_data[depth_key] = depth
         save_data[CACHE_VERSION_KEY] = torch.ones(1)
-        save_file(save_data, cache_path)
+        _atomic_save_file(save_data, cache_path)
 
     del encoder
-    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if zero_depth_count > 0:
         print(
@@ -600,7 +647,7 @@ def cache_video_depth_gt_embeddings(
 
         # Cache hit: reuse if version matches AND cached T == requested T.
         if os.path.exists(cache_path):
-            data = load_file(cache_path)
+            data = _load_then_close(cache_path)
             if (
                 video_depth_key in data
                 and CACHE_VERSION_VIDEO_KEY in data
@@ -681,20 +728,20 @@ def cache_video_depth_gt_embeddings(
 
         file_item.depth_gt_video = depth_video
 
-        os.makedirs(cache_dir, exist_ok=True)
         save_data = {}
         if os.path.exists(cache_path):
             try:
-                existing = load_file(cache_path)
-                save_data = {k: v.clone() for k, v in existing.items()}
+                save_data = _load_then_close(cache_path)
             except Exception:  # noqa: BLE001 — corrupt cache → rewrite
                 save_data = {}
         save_data[video_depth_key] = depth_video
         save_data[CACHE_VERSION_VIDEO_KEY] = torch.ones(1)
-        save_file(save_data, cache_path)
+        _atomic_save_file(save_data, cache_path)
 
     del encoder
-    torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def save_video_depth_preview(
