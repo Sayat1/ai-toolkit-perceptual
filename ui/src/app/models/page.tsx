@@ -210,46 +210,160 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [progress, setProgress] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const upload = () => {
+  // The RunPod/Cloudflare edge and the Next server both handle large bodies fine
+  // (a 128 MiB POST clears server-side in ~1.5s); the real bottleneck is that ONE
+  // TCP stream to the datacenter is bandwidth-delay-product limited — measured
+  // ~13 Mbps while the uplink can do several× that. So we upload many fixed-size
+  // chunks CONCURRENTLY to saturate the link: an `init` pre-allocates the file,
+  // PARALLELISM chunks POST to their byte offsets at once, then we `finalize`. The
+  // server records which offsets landed, so a reload/drop only re-sends the
+  // missing chunks instead of restarting a multi-GB transfer.
+  const CHUNK = 16 * 1024 * 1024; // 16 MiB per chunk — clears the edge, amortizes per-request overhead
+  const PARALLELISM = 8; // concurrent chunk uploads — saturates a high-latency uplink one stream can't
+  const MAX_CHUNK_RETRIES = 6; // per-chunk transient-failure retries before giving up
+
+  const upload = async () => {
     if (!file || uploading) return;
+    const f = file;
     setError(null);
+    setStatus(null);
     setProgress(0);
     setUploading(true);
-    const xhr = new XMLHttpRequest();
-    xhr.upload.addEventListener('progress', e => {
-      if (e.lengthComputable) setProgress(e.loaded / e.total);
-    });
-    xhr.addEventListener('load', () => {
-      setUploading(false);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        setFile(null);
-        setProgress(0);
-        if (inputRef.current) inputRef.current.value = '';
-        onUploaded();
-      } else {
-        try {
-          const body = JSON.parse(xhr.responseText);
-          setError(body.error || `HTTP ${xhr.status}`);
-        } catch {
-          setError(`HTTP ${xhr.status}`);
-        }
-      }
-    });
-    xhr.addEventListener('error', () => {
-      setUploading(false);
-      setError('Network error');
-    });
-    xhr.open('POST', '/api/models/upload');
-    // Mirror what apiClient adds — the project's auth interceptor lives in
-    // axios, not in raw XHR, so we have to plumb the token through ourselves.
+
+    // Mirror what apiClient adds — the project's auth interceptor lives in axios,
+    // not in fetch, so we plumb the bearer token through ourselves on every call.
     const token = typeof window !== 'undefined' ? localStorage.getItem('AI_TOOLKIT_AUTH') : null;
-    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-    xhr.setRequestHeader('X-Filename', file.name);
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-    xhr.send(file);
+    const authH: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+    const post = (headers: Record<string, string>, body?: BodyInit | null) =>
+      fetch('/api/models/upload', { method: 'POST', headers: { ...authH, ...headers }, body: body ?? undefined });
+    // A "hard" error aborts the whole upload; everything else is retried.
+    const hard = (msg: string) => Object.assign(new Error(msg), { hard: true });
+
+    // Plan the chunks up front. A 0-byte file still gets one empty chunk so init +
+    // finalize still produce the (empty) file.
+    const chunks: { offset: number; size: number }[] = [];
+    for (let o = 0; o < f.size; o += CHUNK) chunks.push({ offset: o, size: Math.min(CHUNK, f.size - o) });
+    if (chunks.length === 0) chunks.push({ offset: 0, size: 0 });
+    const totalBytes = f.size || 1;
+
+    // Send one chunk, retrying transient failures (network, 5xx, 429, bodiless edge
+    // bounce) with backoff. A vanished .part (NEED_INIT) re-inits then retries; a
+    // hard 4xx (already exists, unsupported) aborts immediately.
+    const sendOne = async (c: { offset: number; size: number }) => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const r = await post(
+            {
+              'X-Filename': f.name,
+              'X-Chunk-Offset': String(c.offset),
+              'X-File-Size': String(f.size),
+              'Content-Type': 'application/octet-stream',
+            },
+            f.slice(c.offset, c.offset + c.size),
+          );
+          if (r.ok) return;
+          const b = await r.json().catch(() => null);
+          if (r.status === 409 && b?.code === 'NEED_INIT') {
+            await post({ 'X-Filename': f.name, 'X-Upload-Init': '1', 'X-File-Size': String(f.size) });
+          } else if (r.status === 409 && /exists/i.test(b?.error || '')) {
+            throw hard('A model with that filename already exists');
+          } else if (r.status >= 500 || r.status === 429 || !b) {
+            if (attempt >= MAX_CHUNK_RETRIES) throw new Error(b?.error || `Chunk failed (HTTP ${r.status || 0})`);
+          } else {
+            throw hard(b?.error || `Chunk failed (HTTP ${r.status})`);
+          }
+        } catch (e: any) {
+          if (e?.hard) throw e;
+          if (attempt >= MAX_CHUNK_RETRIES) throw e;
+        }
+        await sleep(Math.min(8000, 500 * 2 ** Math.min(attempt, 4)));
+      }
+    };
+
+    try {
+      // Resume probe: bail if already present, else learn which offsets landed.
+      const probeRes = await fetch(`/api/models/upload?filename=${encodeURIComponent(f.name)}`, { headers: authH });
+      const probe = await probeRes.json().catch(() => ({} as any));
+      if (probe?.exists) throw new Error('A model with that filename already exists');
+      const received = new Set<number>(Array.isArray(probe?.received) ? probe.received.map(Number) : []);
+
+      // Init a fresh upload (pre-allocate the .part). Skip if resuming into one.
+      if (!probe?.partExists) {
+        const r = await post({ 'X-Filename': f.name, 'X-Upload-Init': '1', 'X-File-Size': String(f.size) });
+        if (!r.ok) {
+          const b = await r.json().catch(() => null);
+          throw new Error(b?.error || `Could not start upload (HTTP ${r.status})`);
+        }
+        received.clear();
+      }
+
+      let doneBytes = chunks.filter(c => received.has(c.offset)).reduce((s, c) => s + c.size, 0);
+      setProgress(Math.min(1, doneBytes / totalBytes));
+      const pending = chunks.filter(c => !received.has(c.offset));
+      if (received.size > 0 && pending.length > 0) {
+        setStatus(`Resuming — ${received.size}/${chunks.length} chunks already uploaded`);
+      } else {
+        setStatus(`Uploading ${chunks.length} chunk${chunks.length === 1 ? '' : 's'}, ${PARALLELISM} at a time…`);
+      }
+
+      // Worker pool: each worker pulls the next pending chunk until the queue drains.
+      // `pending[idx++]` is atomic between awaits (JS is single-threaded), so no two
+      // workers grab the same chunk. The first failure aborts the rest.
+      let idx = 0;
+      let aborted = false;
+      const worker = async () => {
+        for (;;) {
+          if (aborted) return;
+          const c = pending[idx++];
+          if (!c) return;
+          try {
+            await sendOne(c);
+          } catch (e) {
+            aborted = true;
+            throw e;
+          }
+          doneBytes += c.size;
+          setProgress(Math.min(1, doneBytes / totalBytes));
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(PARALLELISM, Math.max(1, pending.length)) }, worker));
+
+      // Finalize: the server checks every expected offset landed and the .part is
+      // the right size before renaming. If it reports gaps, re-send just those.
+      for (let attempt = 0; ; attempt++) {
+        const r = await post({
+          'X-Filename': f.name,
+          'X-Upload-Finalize': '1',
+          'X-File-Size': String(f.size),
+          'X-Chunk-Size': String(CHUNK),
+        });
+        if (r.ok) break;
+        const b = await r.json().catch(() => null);
+        if (r.status === 409 && b?.code === 'INCOMPLETE' && Array.isArray(b?.missing) && attempt < 3) {
+          const miss = (b.missing as number[]).map(off => ({ offset: off, size: Math.min(CHUNK, f.size - off) }));
+          setStatus(`Re-sending ${miss.length} missing chunk${miss.length === 1 ? '' : 's'}…`);
+          for (const c of miss) await sendOne(c);
+          continue;
+        }
+        throw new Error(b?.error || `Could not finalize upload (HTTP ${r.status})`);
+      }
+
+      setFile(null);
+      setProgress(0);
+      setStatus(null);
+      if (inputRef.current) inputRef.current.value = '';
+      setUploading(false);
+      onUploaded();
+    } catch (e: any) {
+      setUploading(false);
+      setStatus(null);
+      setError(e?.message || 'Upload failed');
+    }
   };
 
   return (
@@ -261,7 +375,8 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
       <p className="text-xs text-gray-500 mb-3">
         Pick a <code className="text-gray-400">.safetensors</code>, <code className="text-gray-400">.ckpt</code>,{' '}
         <code className="text-gray-400">.pt</code>, <code className="text-gray-400">.bin</code>, or{' '}
-        <code className="text-gray-400">.gguf</code> file. The file streams to disk — multi-GB uploads are fine.
+        <code className="text-gray-400">.gguf</code> file. Big multi-GB models are fine; they upload in
+        chunks that auto-size to the connection and resume if it drops.
       </p>
       <input
         ref={inputRef}
@@ -286,6 +401,7 @@ function UploadCard({ onUploaded }: { onUploaded: () => void }) {
           <div className="text-xs text-gray-400 mt-1">
             {(progress * 100).toFixed(1)}% · {formatBytes(progress * (file?.size ?? 0))} of {formatBytes(file?.size ?? 0)}
           </div>
+          {status && <div className="text-xs text-gray-500 mt-1">{status}</div>}
         </div>
       )}
       {error && <div className="text-xs text-red-400 mb-3">{error}</div>}

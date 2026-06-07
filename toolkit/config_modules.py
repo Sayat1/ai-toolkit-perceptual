@@ -29,6 +29,14 @@ class SaveConfig:
         self.push_to_hub: bool = kwargs.get("push_to_hub", False)
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
+        # When True, write a stepped copy of the optimizer state alongside
+        # each checkpoint (e.g. ``{job_name}_000000250_optimizer.pt``) so the
+        # user can roll a stateful optimizer (Adam, Automagic, etc.) back to
+        # the same step as a saved LoRA checkpoint. The canonical
+        # ``optimizer.pt`` is still written for resume-from-latest.
+        # Stepped copies are pruned by ``clean_up_saves`` alongside the
+        # safetensors files via the existing ``max_step_saves_to_keep``.
+        self.save_optimizer_per_checkpoint: bool = kwargs.get('save_optimizer_per_checkpoint', False)
 
 class LoggingConfig:
     def __init__(self, **kwargs):
@@ -1007,6 +1015,20 @@ class FaceIDConfig:
         self.identity_loss_num_refs: int = kwargs.get('identity_loss_num_refs', 0)
         # Track identity metrics even when identity_loss_weight is 0
         self.identity_metrics: bool = kwargs.get('identity_metrics', False)
+        # --- Video (5D) identity loss: per-frame ArcFace over decoded frames ---
+        # Frames per chunk through the ArcFace encoder under gradient
+        # checkpointing (r50 is heavier than DA2-Small; keep this small).
+        self.identity_loss_frames_per_chunk: int = kwargs.get('identity_loss_frames_per_chunk', 4)
+        # Save an animated-webp identity preview every N steps (0 = never).
+        self.identity_loss_preview_every: int = kwargs.get('identity_loss_preview_every', 0)
+        # Cap how many face preview images are retained in id_previews/. Once the
+        # count exceeds this, the oldest files (by creation time) are pruned so a
+        # long run can't fill the job folder. <= 0 keeps everything. Default 500.
+        self.identity_loss_preview_max_keep: int = kwargs.get('identity_loss_preview_max_keep', 500)
+        # Video GT is built from the DECODED clip; a frame is only used as a target
+        # if the detector finds a face in the decoded frame with det_score >= this.
+        # Raise to drop frames the tiny decoder blurs past recognition.
+        self.identity_loss_decoded_det_threshold: float = kwargs.get('identity_loss_decoded_det_threshold', 0.5)
         # Auxiliary landmark shape loss via MediaPipe FaceMesh landmarks
         self.landmark_loss_weight: float = kwargs.get('landmark_loss_weight', 0.0)  # 0 = disabled
         # Auxiliary body proportion loss via MediaPipe BlazePose bone-length ratios
@@ -1014,6 +1036,11 @@ class FaceIDConfig:
         self.body_proportion_loss_min_t: float = kwargs.get('body_proportion_loss_min_t', 0.0)
         self.body_proportion_loss_max_t: float = kwargs.get('body_proportion_loss_max_t', 1.0)
         self.body_proportion_include_head: bool = kwargs.get('body_proportion_include_head', False)
+        # --- Video (5D) body-proportion loss: per-frame ViTPose over decoded frames ---
+        # Frames per chunk through the ViTPose encoder under gradient
+        # checkpointing (ViTPose-base is heavy; keep this small).
+        self.body_proportion_frames_per_chunk: int = kwargs.get('body_proportion_frames_per_chunk', 2)
+        self.body_proportion_preview_every: int = kwargs.get('body_proportion_preview_every', 0)
         # Auxiliary body shape loss via HybrIK SMPL beta prediction
         self.body_shape_loss_weight: float = kwargs.get('body_shape_loss_weight', 0.0)  # 0 = disabled
         self.body_shape_loss_min_t: float = kwargs.get('body_shape_loss_min_t', 0.4)
@@ -1111,6 +1138,11 @@ class DepthConsistencyConfig:
         self.preview_only: bool = kwargs.get('preview_only', False)
         # Preview only for steps whose t-ratio is >= this value (video path).
         self.preview_min_t: float = kwargs.get('preview_min_t', 0.0)
+        # Cap how many depth preview files (image .jpg + video .webp) are kept in
+        # depth_previews/. Once the count exceeds this, the oldest files (by
+        # creation time) are pruned so a long run can't fill the job folder.
+        # <= 0 keeps everything. Default 500.
+        self.preview_max_keep: int = kwargs.get('preview_max_keep', 500)
         # Video path only: frames per DA2 chunk during x0→depth backward. Keeps
         # peak activation memory bounded regardless of the video's total T.
         self.frames_per_chunk: int = kwargs.get('frames_per_chunk', 8)

@@ -20,6 +20,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
@@ -59,17 +60,57 @@ def _atomic_save_file(save_data: dict, cache_path: str) -> None:
 
 
 def _load_then_close(cache_path: str) -> dict:
-    """Load a safetensors file and aggressively release the mmap handle.
+    """Read every tensor from a cache file into owned (non-mmap) storage.
 
-    Detaches every tensor from the underlying mmap by cloning into a fresh
-    dict, drops the original reference, and forces a GC pass so the Rust
-    side can unmap the file before the caller tries to overwrite it.
+    The GT-depth cache shares one ``_face_id_cache/{stem}.safetensors`` per
+    image with the face/body/shape embeddings and every other bucket's depth
+    map, so writing a new bucket's map means reading the existing keys, merging,
+    and rewriting the whole file (safetensors has no in-place append).
+
+    ``load_file`` mmaps the file; cloning each tensor copies it into owned
+    storage, and once ``existing`` drops, refcounting unmaps the file right away
+    (the returned dict has no reference cycle, so a GC pass is not needed to
+    release it). The previous per-item ``gc.collect()`` here was the dominant
+    cost of the caching loop whenever the cache file already existed — and it
+    always does once the face pass has run (it writes these same files first) or
+    when a cache was copied in. A full collect per image is an O(N^2) heap walk
+    that scales with the resident heap (the multi-billion-param trainer model,
+    the VAE, DA2), starving the loop with the GPU idle (~1-3 it/s, ~0% util on
+    an H100). Releasing the mmap never required it, and the rewrite goes through
+    ``_atomic_save_file`` (temp file + ``os.replace``), which is already safe
+    against a live mmap. Mirrors commit a51428c, which removed the same per-item
+    collect from the cache-HIT read path.
     """
     existing = load_file(cache_path)
     copied = {k: v.clone() for k, v in existing.items()}
     del existing
-    gc.collect()
     return copied
+
+
+def _cache_header_shape(cache_path: str, key: str, version_key: str):
+    """Header-only cache-HIT validation: return the shape of ``key`` (a list)
+    when both ``key`` and ``version_key`` are present, else None.
+
+    This is the up-front pass's hit check. It deliberately does NOT read the
+    tensor: ``safe_open`` + ``keys()`` + ``get_slice(key).get_shape()`` touch
+    only the safetensors header (a small JSON blob), never the tensor bytes.
+    The heavy per-map read is deferred to the DataLoader worker
+    (``FileItemDTO.get_depth_gt`` / ``get_depth_gt_video``), so the caching
+    pass stays header-bound — like the latent / text-embedding caches, whose
+    hit path is a bare ``os.path.exists()`` — instead of materializing every
+    map into RAM serially on the main process (the old behaviour, which left
+    the pass crawling even after the per-item ``gc.collect()`` was removed).
+
+    Returns None on an unreadable / corrupt file so the caller recomputes.
+    """
+    try:
+        with safe_open(cache_path, framework="pt", device="cpu") as f:
+            keys = f.keys()
+            if key in keys and version_key in keys:
+                return f.get_slice(key).get_shape()
+    except Exception:  # noqa: BLE001 — corrupt/unreadable cache → recompute
+        return None
+    return None
 
 
 def _blur_cache_suffix(sigma: float) -> str:
@@ -397,6 +438,7 @@ def cache_depth_gt_embeddings(
     config: "DepthConsistencyConfig",  # noqa: F821
     device: Optional[torch.device] = None,
     vae_roundtrip_fn: Optional[callable] = None,  # noqa: A002 (lower-case callable is fine here)
+    store_as_single_frame_video: bool = False,
 ) -> None:
     """Extract and cache GT depth maps for all file items.
 
@@ -413,6 +455,14 @@ def cache_depth_gt_embeddings(
             the round-trip pixels rather than the raw original — that turns
             the floor of the live training loss to zero (the model can
             actually reach the target). Required for v3 caches.
+        store_as_single_frame_video: for video-latent models (LTX-2 / Wan)
+            trained on stills (num_frames=1). The live depth loss for these
+            runs through the 5D video block, which reads a ``(T, H, W)`` cube
+            under the video cache key. When set, the single roundtrip frame is
+            saved as a 1-frame cube under ``depth_gt_video*`` (versioned by
+            ``CACHE_VERSION_VIDEO_KEY``) and ``is_depth_video_cached`` is set,
+            instead of the 2D ``depth_gt*`` image map. Same v3 GT, different
+            consumer.
     """
     from PIL import Image
     from PIL.ImageOps import exif_transpose
@@ -432,6 +482,27 @@ def cache_depth_gt_embeddings(
     _blur_sfx = _blur_cache_suffix(_pix_blur_sigma)
     zero_depth_count = 0
 
+    # Single-frame-video mode stores the same v3 roundtrip GT under the video
+    # cache namespace (key + version + lazy-load flag) so the 5D video depth
+    # block reads it; otherwise everything below is the standard image path.
+    _key_base = "depth_gt_video" if store_as_single_frame_video else "depth_gt"
+    _ver_key = CACHE_VERSION_VIDEO_KEY if store_as_single_frame_video else CACHE_VERSION_KEY
+
+    def _record_lazy_meta(fi, cpath, ckey):
+        # Drop the resident tensor and point the DataLoader worker at the cache
+        # we just wrote (re-read via get_depth_gt / get_depth_gt_video). Same
+        # contract for both the hit and miss paths.
+        if store_as_single_frame_video:
+            fi.depth_gt_video = None
+            fi._depth_video_cache_path = cpath
+            fi._depth_video_cache_key = ckey
+            fi.is_depth_video_cached = True
+        else:
+            fi.depth_gt = None
+            fi._depth_cache_path = cpath
+            fi._depth_cache_key = ckey
+            fi.is_depth_cached = True
+
     for file_item in tqdm(file_items, desc="Caching GT depth maps"):
         img_dir = os.path.dirname(file_item.path)
         cache_dir = os.path.join(img_dir, "_face_id_cache")
@@ -449,14 +520,19 @@ def cache_depth_gt_embeddings(
         _ch = getattr(file_item, 'crop_height', None)
         _cw = getattr(file_item, 'crop_width', None)
         if isinstance(_ch, int) and isinstance(_cw, int) and _ch > 0 and _cw > 0:
-            depth_key = f"depth_gt_{int(_ch)}x{int(_cw)}{_blur_sfx}"
+            depth_key = f"{_key_base}_{int(_ch)}x{int(_cw)}{_blur_sfx}"
         else:
-            depth_key = f"depth_gt{_blur_sfx}"
+            depth_key = f"{_key_base}{_blur_sfx}"
 
         if os.path.exists(cache_path):
-            data = _load_then_close(cache_path)
-            if depth_key in data and CACHE_VERSION_KEY in data:
-                file_item.depth_gt = data[depth_key].clone()
+            # Header-only hit check — record where to read from and defer the
+            # actual tensor load to the DataLoader worker (get_depth_gt). The
+            # bucket-specific depth_key must be validated here (one cache file
+            # holds every bucket's map), but reading the bytes now would
+            # serialize N large reads on the main process and hold them all
+            # resident — the stall this lazy path removes.
+            if _cache_header_shape(cache_path, depth_key, _ver_key) is not None:
+                _record_lazy_meta(file_item, cache_path, depth_key)
                 continue
 
         # v2: run DA2 on the *dataloader-transformed* pixels so cached depth
@@ -490,7 +566,9 @@ def cache_depth_gt_embeddings(
         if depth.abs().sum() < 1e-6:
             zero_depth_count += 1
 
-        file_item.depth_gt = depth
+        # Single-frame-video mode saves the frame as a (1, H, W) cube so the
+        # 5D video depth block (which expects (T, H, W)) reads it as T=1.
+        depth_to_save = depth.unsqueeze(0) if store_as_single_frame_video else depth
 
         save_data = {}
         if os.path.exists(cache_path):
@@ -498,9 +576,15 @@ def cache_depth_gt_embeddings(
                 save_data = _load_then_close(cache_path)
             except Exception:  # noqa: BLE001 — corrupt cache → rewrite from scratch
                 save_data = {}
-        save_data[depth_key] = depth
-        save_data[CACHE_VERSION_KEY] = torch.ones(1)
+        save_data[depth_key] = depth_to_save
+        save_data[_ver_key] = torch.ones(1)
         _atomic_save_file(save_data, cache_path)
+
+        # Don't retain the tensor on the shared file_list item: it would be
+        # deep-copied on every __getitem__ and held resident for every image
+        # at once. Record lazy-load metadata so the worker re-reads from the
+        # just-written cache on later epochs — same contract as the hit path.
+        _record_lazy_meta(file_item, cache_path, depth_key)
 
     del encoder
     gc.collect()
@@ -540,6 +624,36 @@ def load_taehv_wan21(device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
             f"TAEHV checkpoint not found at {ckpt}. "
             "Download taew2_1.pth and place it there before training."
         )
+    tae = TAEHV(checkpoint_path=ckpt).to(device).to(dtype).eval()
+    for p in tae.parameters():
+        p.requires_grad_(False)
+    return tae
+
+
+def load_taehv_ltx2(device: str = "cuda", dtype: torch.dtype = torch.bfloat16, version: str = "2.3"):
+    """Load TAEHV tiny decoder for LTX-2 / LTX-2.3 latents (128-channel).
+
+    LTX counterpart of load_taehv_wan21. The TAEHV class auto-configures
+    patch_size=4 / latent_channels=128 when the checkpoint name contains
+    'taeltx'. madebyollin ships separate weights per generation:
+    ``taeltx2_3.pth`` (LTX-2.3) and ``taeltx_2.pth`` (LTX-2.0). Output is
+    [0, 1] directly (no latents_mean/std denormalization, same as the Wan
+    path). Weights live in ``toolkit/taehv/`` and are auto-downloaded if
+    missing (they are gitignored).
+    """
+    import sys
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _taehv_dir = os.path.join(_here, "taehv")
+    if _taehv_dir not in sys.path:
+        sys.path.insert(0, _taehv_dir)
+    from taehv import TAEHV  # noqa: E402
+    fname = "taeltx2_3.pth" if str(version) == "2.3" else "taeltx_2.pth"
+    ckpt = os.path.join(_taehv_dir, fname)
+    if not os.path.exists(ckpt):
+        import urllib.request
+        url = f"https://raw.githubusercontent.com/madebyollin/taehv/main/{fname}"
+        print(f"DepthConsistency: downloading LTX tiny decoder {fname} from {url} ...")
+        urllib.request.urlretrieve(url, ckpt)
     tae = TAEHV(checkpoint_path=ckpt).to(device).to(dtype).eval()
     for p in tae.parameters():
         p.requires_grad_(False)
@@ -614,8 +728,7 @@ def cache_video_depth_gt_embeddings(
             cached T lines up with the decoded x0 T at training time.
         batch_size: frames per DA2 forward pass during caching.
     """
-    import cv2
-    import numpy as np
+    from toolkit.video_frames import read_video_frames_with_transform
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -646,72 +759,28 @@ def cache_video_depth_gt_embeddings(
         cache_path = os.path.join(cache_dir, f"{stem}.safetensors")
 
         # Cache hit: reuse if version matches AND cached T == requested T.
+        # Header-only — the frame count comes from the stored shape, so the
+        # tensor read defers to the worker (get_depth_gt_video).
         if os.path.exists(cache_path):
-            data = _load_then_close(cache_path)
-            if (
-                video_depth_key in data
-                and CACHE_VERSION_VIDEO_KEY in data
-                and (num_frames is None or data[video_depth_key].shape[0] == num_frames)
+            _shape = _cache_header_shape(
+                cache_path, video_depth_key, CACHE_VERSION_VIDEO_KEY
+            )
+            if _shape is not None and (
+                num_frames is None or _shape[0] == num_frames
             ):
-                file_item.depth_gt_video = data[video_depth_key].clone()
+                file_item.depth_gt_video = None
+                file_item._depth_video_cache_path = cache_path
+                file_item._depth_video_cache_key = video_depth_key
+                file_item.is_depth_video_cached = True
                 continue
 
-        # Read frames sequentially — cv2's CAP_PROP_FRAME_COUNT over-reports by
-        # 1 on some AVI containers and POS_FRAMES seek to the reported last
-        # frame fails silently. Sequential decode gives the actual count.
-        cap = cv2.VideoCapture(file_item.path)
-        all_frames_bgr = []
-        while True:
-            ok, fr = cap.read()
-            if not ok:
-                break
-            all_frames_bgr.append(fr)
-        cap.release()
-        total = len(all_frames_bgr)
-        if total == 0:
+        # Read + transform frames exactly as the dataloader does (flip → resize
+        # → crop), uniformly subsampled to num_frames so cached T matches the
+        # decoded x0 T at training time.
+        video_tensor = read_video_frames_with_transform(file_item, num_frames)
+        if video_tensor is None:
             print(f"  -  Warning: cannot read video frames: {file_item.path}")
             continue
-
-        if num_frames is not None and num_frames < total:
-            indices = np.linspace(0, total - 1, num_frames, dtype=int)
-        else:
-            indices = np.arange(total)
-
-        # v2: apply dataloader flip + resize + crop per frame so cached depth
-        # matches the training video tensor. Same chain used for images.
-        from PIL import Image as _PILImage
-        flip_x = bool(getattr(file_item, 'flip_x', False))
-        flip_y = bool(getattr(file_item, 'flip_y', False))
-
-        frames = []
-        for idx in indices:
-            fr = all_frames_bgr[int(idx)]
-            fr_rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
-            pil = _PILImage.fromarray(fr_rgb)
-            # Per-frame transform (flip happens before resize+crop — same as
-            # dataloader_mixins.load_and_process_video).
-            if flip_x:
-                pil = pil.transpose(_PILImage.FLIP_LEFT_RIGHT)
-            if flip_y:
-                pil = pil.transpose(_PILImage.FLIP_TOP_BOTTOM)
-            stw = getattr(file_item, 'scale_to_width', None)
-            sth = getattr(file_item, 'scale_to_height', None)
-            cx = getattr(file_item, 'crop_x', None)
-            cy = getattr(file_item, 'crop_y', None)
-            cw = getattr(file_item, 'crop_width', None)
-            ch = getattr(file_item, 'crop_height', None)
-            if None not in (stw, sth, cx, cy, cw, ch):
-                pil = pil.resize((int(stw), int(sth)), _PILImage.BICUBIC)
-                pil = pil.crop((int(cx), int(cy),
-                                int(cx) + int(cw), int(cy) + int(ch)))
-            frame_arr = np.asarray(pil, dtype=np.float32) / 255.0
-            frames.append(torch.from_numpy(frame_arr).permute(2, 0, 1))
-
-        if not frames:
-            print(f"  -  Warning: no frames read from {file_item.path}")
-            continue
-
-        video_tensor = torch.stack(frames)  # (T, 3, H, W)
 
         # Per-frame depth via DA2, no-grad, batched. Blur (if configured)
         # is applied per-batch in pixel space so the cached GT depth matches
@@ -726,7 +795,9 @@ def cache_video_depth_gt_embeddings(
                 depth_frames.append(d.detach().cpu().to(torch.float16))
         depth_video = torch.cat(depth_frames, dim=0)  # (T, H_out, W_out)
 
-        file_item.depth_gt_video = depth_video
+        # Don't retain on the shared file_list item — re-read in the worker
+        # (get_depth_gt_video) to keep deepcopy cheap and RAM bounded.
+        file_item.depth_gt_video = None
 
         save_data = {}
         if os.path.exists(cache_path):
@@ -737,6 +808,12 @@ def cache_video_depth_gt_embeddings(
         save_data[video_depth_key] = depth_video
         save_data[CACHE_VERSION_VIDEO_KEY] = torch.ones(1)
         _atomic_save_file(save_data, cache_path)
+
+        # Lazy-load metadata so cleanup_depth releases the resident cube and
+        # the worker re-reads from the just-written cache on later epochs.
+        file_item._depth_video_cache_path = cache_path
+        file_item._depth_video_cache_key = video_depth_key
+        file_item.is_depth_video_cached = True
 
     del encoder
     gc.collect()

@@ -484,6 +484,11 @@ export default function SimpleJob({
               min={1}
               required
             />
+            <Checkbox
+              label="Save optimizer per checkpoint"
+              checked={jobConfig.config.process[0].save.save_optimizer_per_checkpoint || false}
+              onChange={value => setJobConfig(value, 'config.process[0].save.save_optimizer_per_checkpoint')}
+            />
           </Card>
         </div>
         <div>
@@ -525,6 +530,7 @@ export default function SimpleJob({
                   options={[
                     { value: 'adamw8bit', label: 'AdamW8Bit' },
                     { value: 'adafactor', label: 'Adafactor' },
+                    { value: 'rose', label: 'Rose (stateless, experimental)' },
                   ]}
                 />
                 <NumberInput

@@ -7,10 +7,9 @@ An extension of [AI Toolkit by Ostris](https://github.com/ostris/ai-toolkit) tha
 
 These can be used independently or together. Weight noising is the bigger practical win for subject-likeness LoRAs; perceptual anchoring is the bigger win when you need geometric/structural control.
 
-**Supported models:** SDXL, FLUX.2 Klein 9B
-
 ## Contents
 
+- [Supported and Experimental Models](#supported-and-experimental-models): which models are validated, which need more testing
 - [Perceptual Anchoring](#perceptual-anchoring): depth, identity, body, face suppression
 - [Weight Noising](#weight-noising): per-step Gaussian perturbation of LoRA weights
 - [Auto-Masking](#auto-masking): body / clothing / subject masks for region-weighted loss
@@ -19,13 +18,28 @@ These can be used independently or together. Weight noising is the bigger practi
 - [Training Previews](#training-previews): what each anchor saves to disk
 - [Dataset-Tools UI](#dataset-tools-ui): preflight passes for masks, depth, faces
 - [Quickstart Templates](#quickstart-templates): UI presets for validated configs
+- [Z-Image Turbo](#z-image-turbo): model-specific notes, current best-guess settings, ComfyUI inference tip
+- [LTX-2.3 Video (experimental)](#ltx-23-video-experimental): early video training support, example configs
 - [Tips and Tricks](#tips-and-tricks): empirical patterns from training runs
 - [Examples](#examples)
-  - [Sketchwave Style (single-image style LoRA)](#example-sketchwave-style-single-image-style-lora)
   - [Yoshitaka Amano Style (small-dataset style LoRA)](#example-yoshitaka-amano-style-small-dataset-style-lora)
 - [Configuration Reference](#configuration-reference): every extension-specific config option
 - [Upstream: AI Toolkit by Ostris](#upstream-ai-toolkit-by-ostris)
-- [Installation](#installation)
+- [Installation](#installation): local setup, or one-click RunPod template
+- [Running the Web UI](#running-the-web-ui): start the job builder, dataset tools, and training monitors
+
+## Supported and Experimental Models
+
+The model dropdown in the web UI is split into two groups, and the same split applies when you train from a config file.
+
+**Supported:** SDXL, FLUX.2 Klein 9B, and Z-Image Turbo. These are known to work well with both weight noising and perceptual anchors, so they're the safest place to start. FLUX.2 Klein 9B and Z-Image Turbo each have a ready-made [Quickstart Template](#quickstart-templates) you can apply in one click.
+
+**Experimental:** everything else in the selector, including Chroma 1 Base, Chroma 1 HD, Chroma Radiance, Z-Image (base), and LTX-2.3, plus the other architectures you can load from a config. These may work, but they haven't had enough testing to call them validated. When you train one:
+
+- Start from values close to the [Quickstart Templates](#quickstart-templates) and tweak from there.
+- Turn on weight noising first, before you add a perceptual anchor. Weight noising is generally safe and improves results in most cases. Perceptual anchors are stronger but can destabilize training if the strength is wrong, so add one only after the plain weight-noise run looks healthy.
+
+If you get an experimental model working well, please [open an issue](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues) with your config and samples so we can move it into the supported set.
 
 ## Perceptual Anchoring
 
@@ -201,16 +215,6 @@ train:
 - **`relative`** (default): `σ_per_param = sigma × ‖w‖_RMS`. Adapts automatically to per-layer scale, which matters because LoRA layers can have very different gradient/weight magnitudes (LoRA-up vs LoRA-down, attention vs MLP). LoRA-up params (init=0) get no noise until they learn something, so early training is safe by construction.
 - **`absolute`**: fixed σ everywhere. Use when you've calibrated a specific magnitude target across all layers.
 
-### Scaling rules
-
-The effective regularization depends on the Langevin temperature `σ² / lr`. Increasing batch size or LR proportionally weakens the noise's effect; smaller datasets need higher σ to preserve constant per-image regularization. Heuristics:
-
-- **Dataset size**: σ ∝ 1 / √N_effective. Smaller dataset → higher σ.
-- **Batch size**: σ ∝ √B. Larger batch → higher σ.
-- **LR**: σ should decay at least as fast as √lr if you want explore-early-exploit-late dynamics.
-
-Reference points: single-image dataset σ ≈ 0.03–0.05; 50-image dataset σ ≈ 0.02; 500-image diverse dataset σ ≈ 0.01 or skip.
-
 ### Metrics
 
 - **`weight_noise_norm`**: Frobenius norm of the injected noise per logged step. In relative mode this grows with the LoRA's weight magnitude during training; that's normal and expected.
@@ -316,7 +320,32 @@ Current templates:
 - **Subject Likeness, Masked (Flux 2 Klein 9B + Weight Noise)**: same recipe plus subject masking with per-region weights (`background:0`, `clothing:1`, `body:1`) and depth-consistency restricted to the subject mask. Use this when you can be disciplined about captioning only the changeable parts of the character and skipping the background/setting. See the [Tips and Tricks](#tips-and-tricks) section for the rationale.
   - YAML: [`config/examples/subject_likeness_masked_flux2_klein9b.yaml`](config/examples/subject_likeness_masked_flux2_klein9b.yaml)
 
+- **Style LoRA (Flux 2 Klein 9B + Depth Anchor)**: small-dataset style recipe, from the validated [Yoshitaka Amano](#example-yoshitaka-amano-style-small-dataset-style-lora) run. LoKr (linear/alpha 32, conv/alpha 16, full-rank, factor 8) + full-image depth-consistency (`0.005`, DA2-Large at `input_size: 1400`) with diffusion/depth loss splitting (`loss_split: diffusion_depth`). Single 768 bucket, AdamW8bit @ lr=5e-5, batch=2, grad-accum=1, 4000 steps. No weight noise (the block is there, disabled) and no subject mask. On a tiny style set the depth anchor does the work: it pushes the LoRA toward what's invariant across the artist's images (linework, color, paper) and away from memorizing specific compositions.
+  - YAML: [`config/examples/style_lora_flux2_klein9b.yaml`](config/examples/style_lora_flux2_klein9b.yaml)
+
+- **Subject Likeness (Z-Image Turbo + Weight Noise)**: see [Z-Image Turbo](#z-image-turbo) below. LoKr + weight noise (relative, σ=0.0125) via the de-distill training adapter. Single 1024 bucket, subject-masked depth-consistency (`background:0`, `clothing:1`), AdamW8bit @ lr=2.5e-4, batch=4, 3000 steps. Custom timestep distribution and curve to front-load high-t and low-mid-t training. Transformer in bf16 (Tongyi-MAI warns against FP8 on Turbo), text encoder quantized to qfloat8.
+  - YAML: [`config/examples/subject_likeness_zimage_turbo.yaml`](config/examples/subject_likeness_zimage_turbo.yaml)
+
 Templates live in `ui/src/app/jobs/new/quickstarts.ts`; the YAML files under `config/examples/` mirror them and stay in sync. Adding a new template is a one-export change on the TS side plus a YAML mirror. The chosen template name shows in the dropdown label and stays there until you pick another. It's not saved to the config; the form *is* the template after apply.
+
+## Z-Image Turbo
+
+Z-Image Turbo works well with weight noising and the depth anchor, so it's in the supported set, but the quickstart is still a best guess from a few production runs rather than a fully tuned recipe. If you find settings that work better, please [open an issue](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues) with your config and samples. Step/LR/sigma sweeps, multi-bucket evidence, and reports on Z-Image base are all useful.
+
+A few notes:
+
+- The de-distill adapter (`ostris/zimage_turbo_training_adapter_v2`) is merged at load with `+1.0` and runtime-inverted to `-1.0` at sample time. The optimizer sees a base-like model; the LoRA inverts back to 8-step turbo at inference.
+- Don't quantize the transformer. Tongyi-MAI warns FP8 on Turbo causes noticeable quality degradation, so the quickstart keeps `model.quantize: false`. Text encoder quantization is fine.
+- Z-Image reuses the Flux VAE byte-for-byte, so Flux caption and cropping habits transfer.
+- ZiT can take up to **200 steps per training image** to converge, noticeably more than Flux 2 Klein typically needs. The quickstart defaults to 3000 steps so a 10 to 15 image dataset has room to settle. Optimizations to bring this down are in progress.
+
+For inference, [RES_2S](https://github.com/ClownsharkBatwing/RES4LYF) at 8 steps tends to look noticeably cleaner than the default Euler/DPM samplers most ComfyUI workflows use. Fine eye and iris detail holds up better.
+
+The trainer uses a fixed `shift=3.0` rather than the dynamic shifting `diffusers.ZImagePipeline` defaults to. That matches the ComfyUI workflow, so trained LoRAs look right there; the mismatch is preview-only.
+
+## LTX-2.3 Video (experimental)
+
+Early support for training LoRAs on LTX-2.3 (22B), the video model, including the depth-consistency anchor applied across frames. It's fresh and only lightly tested, so treat the example configs as starting points rather than tuned recipes. Grab one from `config/examples/` to start: `train_lora_ltx23_24gb_smoke.yaml` for a quick smoke test, `train_lora_ltx23_80gb.yaml` for a real run, or `train_ltx23_cartwheel_lokr.yaml` for a worked example. If you find settings that hold up, [open an issue](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/issues) with your config and samples.
 
 ## Tips and Tricks
 
@@ -361,54 +390,21 @@ datasets:
 
 The Subject Likeness quickstart uses exactly this ratio.
 
+### Start with a small dataset
+
+With these methods **you need far fewer images** than you'd think to get good, generalizable results. Start with **10 to 15 images** picked for quality and diversity. If that converges well, try adding more images to the same run or restart with the larger dataset. Going big from the start tends to be wasted effort.
+
+### Body horror mid-training is usually fine
+
+Anecdotally, you may see more body horror and extra limbs partway through training when weight noising is on. This is normal. The noise pushes the weights around more between optimizer steps, so some checkpoints may diverge pretty badly before the run converges.
+
+Rough heuristic: budget around **80 to 100 steps per training image**. If you're sampling every 25 steps and see continuous body horror for more than 20% of the run, the noise sigma is probably too high. Lower it in increments of 0.0025 until it resolves. We're still figuring out the training dynamics across different datasets, so reports of what worked (or didn't) are welcome.
+
+I recommend saving checkpoints every 25 steps. The optimal checkpoint is often in a narrow window.
+
 ## Examples
 
 > **Note on inference target.** All example configs in this README and under `config/examples/` are tuned for inference against the **distilled** model (Flux 2 Klein). If you plan to apply the trained LoRAs against the **base (non-distilled)** model instead, checkpoints in the **500–800 step range** are usually closer to optimal than the **1000–1200 step range** the configs save out.
-
-### Example: Sketchwave Style (single-image style LoRA)
-
-Training a style LoRA from a single image. One training image, one caption, and the LoRA picks up an entire visual vocabulary.
-
-Sketchwave is a specific look: sketchy graphite-style linework over warm cream paper, with restricted earthy palettes (olive-green, ochre, wine-red, sepia) and slightly painterly shading. There's one training image, a portrait. The goal is for the LoRA to apply the look to anything the base model can paint, including subjects with nothing in common with the portrait.
-
-Dataset layout:
-
-```
-examples/sketchwave/dataset/
-├── 1.webp     # single training image
-└── 1.txt      # caption
-```
-
-The caption opens with the trigger phrase `sketchwave style.` and then describes the image in detail: figure, clothing, lighting, and an explicit enumeration of the palette ("warm cream-yellow background, tan-and-ochre skin, dark sepia-brown linework, dark brown-black hair..."). Calling out the palette is deliberate. In LoRA training, anything you describe in the caption stays controllable at inference, while anything you leave out becomes part of what the trigger word bakes in. Naming the colors here teaches the LoRA that those are content choices in this particular image, not the essence of sketchwave style itself, so the trigger applies later with whatever palette you prompt for.
-
-The training image itself:
-
-| ![Reference](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/dataset_reference.webp) |
-|:---:|
-| The single training illustration. |
-
-Full config is at [`examples/sketchwave/config.yaml`](examples/sketchwave/config.yaml). Key bits:
-
-- LoKr, linear/alpha 32, conv/alpha 16, full-rank, factor 8.
-- 1200 steps, batch size 1, gradient accumulation 2.
-- Resolution 768.
-- 1 image, `num_repeats: 50`.
-- Depth anchor: weight `0.005`, DA2-Large at `input_size: 1400`, `mask_source: none`.
-- Loss splitting on the dataset (`loss_split: diffusion_depth`).
-
-The interesting part is how the trained LoRA generalizes. None of these outputs share a subject with the training image. The LoRA carries the linework, palette, and paper-like shading onto identities and scenes with nothing in common with the training portrait, including an animal and an outdoor landscape:
-
-| New portrait | Different woman | Sleeping fox | Lakeside scene |
-|:---:|:---:|:---:|:---:|
-| ![Portrait](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_portrait.png) | ![Lady](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_lady.png) | ![Fox](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_fox.png) | ![Landscape](https://github.com/BuffaloBuffaloBuffaloBuffalo/ai-toolkit-perceptual/releases/download/examples-sketchwave-v1/output_landscape.png) |
-
-To reproduce:
-
-```bash
-python run.py examples/sketchwave/config.yaml
-```
-
-Edit `model.name_or_path` in the config to point at your local Flux 2 Klein checkpoint first.
 
 ### Example: Yoshitaka Amano Style (small-dataset style LoRA)
 
@@ -603,11 +599,26 @@ This extension is based on [AI Toolkit](https://github.com/ostris/ai-toolkit), a
 
 ## Installation
 
+### Run on RunPod
+
+No local GPU? [**Deploy the prebuilt RunPod template →**](https://console.runpod.io/deploy?template=bn89xhug15&ref=hfo6q4j3). It runs the same Docker image this repo builds, with the web UI already up on port 8675.
+
+### Local install
+
 Requirements:
-- Python >3.10
+- Python 3.12 (3.10 and 3.11 are fine too). Don't use 3.13 or newer yet, see the note below.
 - Nvidia GPU with enough VRAM for what you're training
 - Python venv
 - git
+
+**Heads up on Python 3.13:** a few of the native dependencies (insightface, onnxruntime, torchcodec) don't ship wheels for 3.13 yet, especially on Windows. If you build your venv with 3.13 the install ends up broken and the trainer dies during startup before it can even write a log file, so from the UI it just looks like the job is stuck on "starting" forever with no error in the log. Use 3.12 and you'll be fine.
+
+If your system Python is already 3.13 or newer, the easy fix is to make a 3.12 environment with conda and run everything inside it:
+```bash
+conda create -n ai-toolkit python=3.12
+conda activate ai-toolkit
+# then run the torch + requirements install steps below
+```
 
 Linux:
 ```bash
@@ -630,5 +641,25 @@ pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --
 pip install -r requirements.txt
 ```
 
+**RTX 50-series (Blackwell) GPUs:** the `cu126` build pinned above has no kernels for your card, so training dies with `CUDA error: no kernel image is available for execution on the device`. Install torch from the `cu128` channel instead (run this in place of the torch line above):
+```bash
+pip install torch==2.11.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
 For devices running **DGX OS** (including DGX Spark), follow [these](dgx_instructions.md) instructions.
+
+## Running the Web UI
+
+Job creation, the dataset-tools preflights, and live training monitors all live in the web UI. Since this repo only documents what it adds on top of upstream AI Toolkit, it's easy to miss how to start the UI itself.
+
+After a local install, launch it from the `ui/` directory:
+
+```bash
+cd ui
+npm run build_and_start
+```
+
+This installs the UI's Node dependencies, initializes its database, builds, and serves the app at **http://localhost:8675** (requires Node.js 18+). The first run does the full build; afterwards `npm run start` restarts it without rebuilding.
+
+> Using the RunPod template? The UI is already running, so just open port **8675** from the pod's **Connect** menu.
 

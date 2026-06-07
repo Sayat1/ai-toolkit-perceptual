@@ -78,6 +78,12 @@ export interface SaveConfig {
   max_step_saves_to_keep: number;
   save_format: string;
   push_to_hub: boolean;
+  /** Write a stepped copy of the optimizer state alongside each checkpoint
+   *  (e.g. ``{job}_000000250_optimizer.pt``) so stateful optimizers can be
+   *  rolled back to a specific checkpoint. The canonical ``optimizer.pt`` is
+   *  still written for resume-from-latest. Stepped copies are pruned by
+   *  ``max_step_saves_to_keep``. Defaults to false. */
+  save_optimizer_per_checkpoint?: boolean;
 }
 
 export interface DatasetConfig {
@@ -298,6 +304,8 @@ export interface FaceIDConfig {
   identity_loss_average_blend?: number;
   identity_loss_use_random?: boolean;
   identity_loss_num_refs?: number;
+  // Keep only the newest N face preview images in id_previews/ (<=0 = keep all)
+  identity_loss_preview_max_keep?: number;
   identity_metrics?: boolean;
   landmark_loss_weight?: number;
   body_proportion_loss_weight?: number;
@@ -365,6 +373,8 @@ export interface DepthConsistencyConfig {
   grad_checkpoint?: boolean;
   // Preview cadence (steps); 0 disables
   preview_every?: number;
+  // Keep only the newest N preview files in depth_previews/ (<=0 = keep all)
+  preview_max_keep?: number;
 }
 
 export interface ProcessConfig {
