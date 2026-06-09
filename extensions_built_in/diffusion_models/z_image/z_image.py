@@ -158,18 +158,34 @@ class ZImageModel(BaseModel):
         transformer_path = model_path
         transformer_subfolder = "transformer"
         if os.path.exists(transformer_path):
-            transformer_subfolder = None
-            transformer_path = os.path.join(transformer_path, "transformer")
-            # check if the path is a full checkpoint.
-            te_folder_path = os.path.join(model_path, "text_encoder")
-            # if we have the te, this folder is a full checkpoint, use it as the base
-            if os.path.exists(te_folder_path):
-                base_model_path = model_path
+            if os.path.isdir(transformer_path):
+                transformer_subfolder = None
+                transformer_path = os.path.join(transformer_path, "transformer")
+                # check if the path is a full checkpoint.
+                te_folder_path = os.path.join(model_path, "text_encoder")
+                # if we have the te, this folder is a full checkpoint, use it as the base
+                if os.path.exists(te_folder_path):
+                    base_model_path = model_path
+                transformer = ZImageTransformer2DModel.from_pretrained(
+                    transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
+                )
+            else:
+                #load from single file
+                original_sd = load_file(transformer_path)
+                out_sd = {}
+                replace_keys = {"model.diffusion_model.":""}
+                for k in original_sd:
+                    w = original_sd[k]
+                    w = w.to(dtype)
+                    k_out = k
+                    for r, rr in replace_keys.items():
+                        k_out = k_out.replace(r, rr)
+                    out_sd[k_out] = w
 
-        transformer = ZImageTransformer2DModel.from_pretrained(
-            transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
-        )
-
+                del original_sd
+                transformer = ZImageTransformer2DModel.from_single_file(out_sd, low_cpu_mem_usage=True, torch_dtype=dtype)
+                del out_sd
+        
         # load assistant lora if specified
         if self.model_config.assistant_lora_path is not None:
             self.load_training_adapter(transformer)
