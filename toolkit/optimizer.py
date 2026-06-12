@@ -110,6 +110,9 @@ def get_optimizer(
     elif lower_type == 'automagic':
         from toolkit.optimizers.automagic import Automagic
         optimizer = Automagic(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type == 'automagic3':
+        from toolkit.optimizers.automagic3 import Automagic3
+        optimizer = Automagic3(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'rose':
         # Range-Of-Slice Equilibration optimizer (Kieren 2026, Apache 2.0).
         # Stateless: no per-param momentum/variance buffers; uses per-slice

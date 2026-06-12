@@ -198,3 +198,4 @@ aitk_db.db
 
 # playwright-cli scratch (snapshots, console/request logs)
 /.playwright-cli/
+ui/package-lock.json
