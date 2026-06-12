@@ -5046,7 +5046,7 @@ class SDTrainer(BaseSDTrainProcess):
             if batch.mask_tensor is not None:
                 with self.timer('get_mask_multiplier'):
                     # upsampling no supported for bfloat16
-                    mask_multiplier = batch.mask_tensor.to(self.device_torch, dtype=torch.float16).detach()
+                    mask_multiplier = batch.mask_tensor.to(self.device_torch, dtype=torch.float32).detach()
                     # scale down to the size of the latents, mask multiplier shape(bs, 1, width, height), noisy_latents shape(bs, channels, width, height)
                     if len(noisy_latents.shape) == 5:
                         # video B,C,T,H,W
