@@ -1372,7 +1372,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     else:
                         # todo, some schedulers use indices, otheres use timesteps. Not sure what to do here
                         min_idx = min_noise_steps + 1
-                        max_idx = max_noise_steps - 1
+                        max_idx = max_noise_steps# - 1 ?? 이미 999인데 왜 한번 더깎음?
                         if self.train_config.noise_scheduler == 'flowmatch':
                             # flowmatch uses indices, so we need to use indices
                             min_idx = min_noise_steps
